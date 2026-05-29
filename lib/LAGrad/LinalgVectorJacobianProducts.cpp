@@ -1,6 +1,6 @@
 #include "LAGrad/Utils.h"
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
-#include "mlir/Dialect/Linalg/IR/LinalgOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Transforms/DialectConversion.h"
 
 namespace mlir {
@@ -8,18 +8,21 @@ Value reverseGenericOp(linalg::GenericOp op, LAGradContext &ctx, Value operand,
                        Value vjp_value, int op_index, Value output,
                        ConversionPatternRewriter &rewriter) {
   // Need to ensure:
-  // if (op_index > (size_t)genericOp.getNumInputs() - 1)
+  // if (op_index > (size_t)genericOp.getNumDpsInputs() - 1)
   //   continue;
-  auto numIterators = op.iterator_types().size();
+  auto numIterators = op.getIteratorTypesArray().size();
   SmallVector<AffineMap, 6> indexing_maps(
       op->getNumOperands() + 1, rewriter.getMultiDimIdentityMap(numIterators));
-  SmallVector<StringRef, 6> iterator_types(numIterators,
-                                           getParallelIteratorTypeName());
+  SmallVector<utils::IteratorType, 6> iterator_types(numIterators,
+                                                     utils::IteratorType::parallel);
 
   auto outputShape = output.getType().dyn_cast_or_null<ShapedType>();
   assert(outputShape && outputShape.hasRank() &&
          "output must be a ranked type");
-  SmallVector<AffineMap> generic_indexing_maps = op.getIndexingMaps();
+  SmallVector<AffineMap> generic_indexing_maps;
+  for (auto attr : op.getIndexingMaps()) {
+    generic_indexing_maps.push_back(cast<AffineMapAttr>(attr).getValue());
+  }
   unsigned int op_count = op.getNumOperands();
   SmallVector<Value> inputs;
   for (size_t i = 0; i < op_count; i++) {
@@ -37,7 +40,7 @@ Value reverseGenericOp(linalg::GenericOp op, LAGradContext &ctx, Value operand,
         AffineMap outputMap = generic_indexing_maps[op_index];
         for (size_t idx = 0; idx < outputMap.getNumDims(); idx++) {
           if (!outputMap.isFunctionOfDim(idx)) {
-            iterator_types[idx] = getReductionIteratorTypeName();
+            iterator_types[idx] = utils::IteratorType::reduction;
           }
         }
       }
@@ -67,7 +70,7 @@ Value reverseGenericOp(linalg::GenericOp op, LAGradContext &ctx, Value operand,
       [&](OpBuilder &builder, Location loc, ValueRange regionArgs) {
         PatternRewriter::InsertionGuard insertionGuard(rewriter);
         SmallVector<mlir::Operation *> genericRegionOps =
-            cloneBasicBlock(op.getOps(), builder, regionArgs, genericOperands);
+            cloneBasicBlock(llvm::make_range(op.getBodyRegion().op_begin(), op.getBodyRegion().op_end()), builder, regionArgs, genericOperands);
 
         for (auto it = genericRegionOps.rbegin(); it != genericRegionOps.rend();
              it++) {

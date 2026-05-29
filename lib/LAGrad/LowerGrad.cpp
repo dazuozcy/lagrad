@@ -3,10 +3,13 @@
 #include "LAGrad/Passes.h"
 #include "LAGrad/Transforms.h"
 #include "LAGrad/Utils.h"
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
-#include "mlir/Dialect/Linalg/IR/LinalgOps.h"
-#include "mlir/Dialect/SCF/SCF.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -27,19 +30,19 @@ public:
       return failure();
     }
 
-    rewriter.replaceOpWithNewOp<CallOp>(op, funcOp, op.getOperands());
+    rewriter.replaceOpWithNewOp<func::CallOp>(op, funcOp, op.getOperands());
     return success();
   }
 
 private:
-  static FuncOp generateAdjointFunc(lagrad::GradOp gradOp,
+  static func::FuncOp generateAdjointFunc(lagrad::GradOp gradOp,
                                     ConversionPatternRewriter &rewriter) {
     auto moduleOp = gradOp->getParentOfType<ModuleOp>();
-    auto originalFuncOp = moduleOp.lookupSymbol<FuncOp>(gradOp.FAttr());
+    auto originalFuncOp = moduleOp.lookupSymbol<func::FuncOp>(gradOp.getFAttr());
 
     std::string adjointFuncName = ("__grad_" + originalFuncOp.getName()).str();
 
-    if (auto existingAdjoint = moduleOp.lookupSymbol<FuncOp>(adjointFuncName)) {
+    if (auto existingAdjoint = moduleOp.lookupSymbol<func::FuncOp>(adjointFuncName)) {
       return existingAdjoint;
     }
 
@@ -52,7 +55,7 @@ private:
 
     // If we received request for a custom gradient signal, this is equivalent
     // to taking in the gradient signal as a parameter.
-    FuncOp funcOp =
+    func::FuncOp funcOp =
         copyFunctionDeclaration(originalFuncOp, adjointFuncName, rewriter);
     LAGradContext lagradctx{moduleOp};
     DEBUGpopulateFunc(lagradctx.debug_names, funcOp);
@@ -69,8 +72,8 @@ private:
 namespace {
 struct GradTarget : public ConversionTarget {
   GradTarget(MLIRContext &ctx) : ConversionTarget(ctx) {
-    addLegalDialect<mlir::StandardOpsDialect>();
-    addLegalDialect<mlir::arith::ArithmeticDialect>();
+    addLegalDialect<mlir::func::FuncDialect>();
+    addLegalDialect<mlir::arith::ArithDialect>();
     addLegalDialect<mlir::math::MathDialect>();
     addLegalDialect<mlir::memref::MemRefDialect>();
     addLegalDialect<tensor::TensorDialect>();
@@ -78,7 +81,7 @@ struct GradTarget : public ConversionTarget {
     addLegalDialect<linalg::LinalgDialect>();
     addIllegalDialect<lagrad::LAGradDialect>();
     addLegalOp<lagrad::PackOp>();
-    addLegalOp<FuncOp>();
+    addLegalOp<func::FuncOp>();
   }
 };
 } // end anonymous namespace
@@ -101,7 +104,7 @@ void GradConversionPass::runOnOperation() {
   GradTarget target(getContext());
   target.addLegalOp<ModuleOp>();
 
-  OwningRewritePatternList patterns(&getContext());
+  RewritePatternSet patterns(&getContext());
   patterns.insert<GradOpLowering>(&getContext());
   lagrad::populateLAGradTransforms(patterns, &getContext());
 

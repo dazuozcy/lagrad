@@ -1,5 +1,5 @@
-#include "mlir/Dialect/Linalg/IR/LinalgOps.h"
-#include "mlir/Dialect/SCF/SCF.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Pass/AnalysisManager.h"
@@ -25,7 +25,7 @@ private:
   DenseSet<Operation *> matchingInserts;
   DenseSet<Operation *> linalgInPlaceOps;
 
-  Optional<tensor::InsertSliceOp>
+  std::optional<tensor::InsertSliceOp>
   getMatchingInsertSlice(tensor::ExtractSliceOp op,
                          const DominanceInfo &dom) const;
 };
@@ -43,10 +43,10 @@ struct LoopNest {
 
 struct SparsePropagation {
   SparsePropagation(Operation *op, AnalysisManager &am);
-  Optional<HotSparsityType> getSparsityType(Value val) const;
-  Optional<HotSparsityType> getSparsityEncoding(RankedTensorType type) const;
+  std::optional<HotSparsityType> getSparsityType(Value val) const;
+  std::optional<HotSparsityType> getSparsityEncoding(RankedTensorType type) const;
   void setIndices(Value tensor, Value indices);
-  Optional<Value> getIndices(Value tensor);
+  std::optional<Value> getIndices(Value tensor);
 
 private:
   DenseMap<Value, std::string> debug_names;
@@ -61,7 +61,7 @@ private:
 struct LoopNestAnalysis {
 public:
   LoopNestAnalysis(Operation *op);
-  Optional<LoopNest> getLoopNest(scf::ForOp op) const;
+  std::optional<LoopNest> getLoopNest(scf::ForOp op) const;
   bool isLoopNest(scf::ForOp op) const;
 
 private:

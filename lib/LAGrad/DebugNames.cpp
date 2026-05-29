@@ -115,7 +115,7 @@ void DEBUGpopulateRegion(Region *region, std::fstream &sourceFile,
 
       tokens.clear();
       parseCommaSepParens(src, tokens);
-      assert(tokens.size() == forOp.getNumIterOperands() &&
+      assert(tokens.size() == forOp.getNumRegionIterArgs() &&
              "Mismatch of parsed names and for op iter args");
       for (auto pair : llvm::zip(forOp.getRegionIterArgs(), tokens)) {
         subs = std::get<1>(pair).substr(0, std::get<1>(pair).find('='));
@@ -124,9 +124,9 @@ void DEBUGpopulateRegion(Region *region, std::fstream &sourceFile,
 
       DEBUGpopulateRegion(&forOp.getRegion(), sourceFile, debug_names);
     } else if (auto ifOp = dyn_cast_or_null<scf::IfOp>(&op)) {
-      DEBUGpopulateRegion(&ifOp.thenRegion(), sourceFile, debug_names);
-      DEBUGpopulateRegion(&ifOp.elseRegion(), sourceFile, debug_names);
-    } else if (auto callOp = dyn_cast_or_null<CallOp>(&op)) {
+      DEBUGpopulateRegion(&ifOp.getThenRegion(), sourceFile, debug_names);
+      DEBUGpopulateRegion(&ifOp.getElseRegion(), sourceFile, debug_names);
+    } else if (auto callOp = dyn_cast_or_null<func::CallOp>(&op)) {
       if (callOp.getNumResults() > 1) {
         assert(src.find('=') != std::string::npos &&
                "Expect op line to contain equals sign");
@@ -137,7 +137,7 @@ void DEBUGpopulateRegion(Region *region, std::fstream &sourceFile,
       }
       auto moduleOp = op.getParentOfType<ModuleOp>();
       assert(moduleOp && "module op was null");
-      auto calledFunc = moduleOp.lookupSymbol<FuncOp>(callOp.calleeAttr());
+      auto calledFunc = moduleOp.lookupSymbol<func::FuncOp>(callOp.getCalleeAttr());
       assert(calledFunc && "failed to find called function");
       DEBUGpopulateFunc(debug_names, calledFunc);
     }
@@ -159,7 +159,7 @@ void DEBUGpopulateRegion(Region *region, std::fstream &sourceFile,
   // llvm::errs() << "]\n";
 }
 
-void DEBUGpopulateFunc(NameMap &debug_names, FuncOp funcOp) {
+void DEBUGpopulateFunc(NameMap &debug_names, func::FuncOp funcOp) {
   if (!ENABLE_NAME_DEBUG || funcOp.empty()) {
     return;
   }

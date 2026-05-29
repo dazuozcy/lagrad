@@ -4,10 +4,10 @@
  */
 #include "LAGrad/Passes.h"
 #include "LAGrad/Utils.h"
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
@@ -36,18 +36,15 @@ public:
       return failure();
     }
 
-    auto elementType = ptrToIntOp.arg()
-                           .getType()
-                           .dyn_cast<LLVM::LLVMPointerType>()
-                           .getElementType();
+    auto elementType = gepOp.getElemType();
 
     size_t allocSize = elementType.getIntOrFloatBitWidth() / 8;
-    for (auto indexVal : gepOp.indices()) {
+    for (auto indexVal : gepOp.getIndices()) {
       auto indexConstOp =
-          dyn_cast_or_null<LLVM::ConstantOp>(indexVal.getDefiningOp());
+          dyn_cast_or_null<LLVM::ConstantOp>(indexVal.get<mlir::Value>().getDefiningOp());
       assert(indexConstOp &&
              "Expected index value to be defined by a constant op");
-      allocSize *= indexConstOp.value()
+      allocSize *= indexConstOp.getValue()
                        .dyn_cast<IntegerAttr>()
                        .getValue()
                        .getSExtValue();
@@ -55,7 +52,7 @@ public:
 
     auto staticSize = rewriter.create<LLVM::ConstantOp>(
         op->getLoc(), rewriter.getI64Type(), rewriter.getIndexAttr(allocSize));
-    rewriter.updateRootInPlace(op, [&]() { op.setOperand(staticSize); });
+    rewriter.modifyOpInPlace(op, [&]() { op.setOperand(staticSize); });
     return success();
   }
 };
@@ -68,7 +65,7 @@ public:
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
     auto callOp = dyn_cast_or_null<LLVM::CallOp>(op);
-    if (!callOp || callOp.calleeAttr().getValue() != "malloc") {
+    if (!callOp || callOp.getCalleeAttr().getValue() != "malloc") {
       return failure();
     }
 
@@ -87,25 +84,22 @@ public:
       return failure();
     }
 
-    auto elementType = ptrToIntOp.arg()
-                           .getType()
-                           .dyn_cast<LLVM::LLVMPointerType>()
-                           .getElementType();
+    auto elementType = gepOp.getElemType();
 
     size_t allocSize = elementType.getIntOrFloatBitWidth() / 8;
-    if (!llvm::all_of(gepOp.indices(), [](Value indexVal) {
-          return isa<LLVM::ConstantOp>(indexVal.getDefiningOp());
+    if (!llvm::all_of(gepOp.getIndices(), [](auto indexVal) {
+          return isa<LLVM::ConstantOp>(indexVal.template get<mlir::Value>().getDefiningOp());
         })) {
       // Enzyme appears to handle dynamic shapes okay.
       return failure();
     }
 
-    for (auto indexVal : gepOp.indices()) {
+    for (auto indexVal : gepOp.getIndices()) {
       auto indexConstOp =
-          dyn_cast_or_null<LLVM::ConstantOp>(indexVal.getDefiningOp());
+          dyn_cast_or_null<LLVM::ConstantOp>(indexVal.get<mlir::Value>().getDefiningOp());
       assert(indexConstOp &&
              "Expected index value to be defined by a constant op");
-      allocSize *= indexConstOp.value()
+      allocSize *= indexConstOp.getValue()
                        .dyn_cast<IntegerAttr>()
                        .getValue()
                        .getSExtValue();
@@ -113,8 +107,8 @@ public:
 
     auto staticSize = rewriter.create<LLVM::ConstantOp>(
         op->getLoc(), rewriter.getI64Type(), rewriter.getIndexAttr(allocSize));
-    rewriter.updateRootInPlace(callOp,
-                               [&]() { callOp.setOperand(0, staticSize); });
+    rewriter.modifyOpInPlace(callOp,
+                             [&]() { callOp.setOperand(0, staticSize); });
     return success();
   }
 };
@@ -137,7 +131,7 @@ struct StaticAllocsPass
     patterns.add<ConvertStaticMalloc>(patterns.getContext());
     patterns.add<ConvertStaticAlloca>(patterns.getContext());
 
-    if (failed(applyPatternsAndFoldGreedily(getOperation()->getRegions(),
+    if (failed(applyPatternsAndFoldGreedily(getOperation(),
                                             std::move(patterns)))) {
       signalPassFailure();
     }

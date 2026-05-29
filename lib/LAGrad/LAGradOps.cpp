@@ -8,6 +8,7 @@
 
 #include "LAGrad/LAGradOps.h"
 #include "LAGrad/LAGradDialect.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OpImplementation.h"
 
@@ -16,14 +17,14 @@
 using namespace mlir;
 using namespace lagrad;
 
-static LogicalResult verify(PackOp op) {
-  ShapedType sourceType = op.source().getType().cast<ShapedType>();
-  ShapedType destType = op.getType();
+LogicalResult PackOp::verify() {
+  ShapedType sourceType = getSource().getType().cast<ShapedType>();
+  ShapedType destType = getType();
   if (sourceType.getShape() != destType.getShape()) {
-    return op.emitOpError("Expected source and dest to have same shape");
+    return emitOpError("Expected source and dest to have same shape");
   }
   if (sourceType.getElementType() != destType.getElementType()) {
-    return op.emitOpError("Expected source and dest to have same element type");
+    return emitOpError("Expected source and dest to have same element type");
   }
   return success();
 }
@@ -33,13 +34,13 @@ LogicalResult GradOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   auto fnAttr = (*this)->getAttrOfType<FlatSymbolRefAttr>("F");
   if (!fnAttr)
     return emitOpError("requires a 'F' symbol reference attribute");
-  FuncOp fn = symbolTable.lookupNearestSymbolFrom<FuncOp>(*this, fnAttr);
+  func::FuncOp fn = symbolTable.lookupNearestSymbolFrom<func::FuncOp>(*this, fnAttr);
   if (!fn)
     return emitOpError() << "'" << fnAttr.getValue()
                          << "' does not reference a valid function";
 
   // Verify that the operand and result types match the callee.
-  auto fnType = fn.getType();
+  auto fnType = fn.getFunctionType();
   bool customGradSignal = (*this)->hasAttrOfType<UnitAttr>("grad_signal");
 
   if (fnType.getNumInputs() !=
@@ -95,7 +96,7 @@ LogicalResult TangentOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   auto fnAttr = (*this)->getAttrOfType<FlatSymbolRefAttr>("F");
   if (!fnAttr)
     return emitOpError("requires a 'F' symbol reference attribute");
-  FuncOp fn = symbolTable.lookupNearestSymbolFrom<FuncOp>(*this, fnAttr);
+  func::FuncOp fn = symbolTable.lookupNearestSymbolFrom<func::FuncOp>(*this, fnAttr);
   if (!fn)
     return emitOpError() << "'" << fnAttr.getValue()
                          << "' does not reference a valid function";

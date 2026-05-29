@@ -4,12 +4,14 @@
  */
 #include "LAGrad/Passes.h"
 #include "LAGrad/Utils.h"
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
-#include "mlir/Dialect/Linalg/IR/LinalgOps.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/SCF.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/Passes.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -70,7 +72,7 @@ void eraseTriangularEncoding(Value operand, PatternRewriter &rewriter) {
       auto definingOp = operand.getDefiningOp();
       if (definingOp && dyn_cast_or_null<arith::ConstantOp>(definingOp)) {
         auto constOp = dyn_cast<arith::ConstantOp>(definingOp);
-        auto attr = constOp.valueAttr();
+        auto attr = constOp.getValueAttr();
         if (attr.isa<DenseElementsAttr>()) {
           auto dattr = attr.cast<DenseElementsAttr>();
           assert(dattr.isSplat() && "triangular loops for non-splatted dense "
@@ -79,7 +81,7 @@ void eraseTriangularEncoding(Value operand, PatternRewriter &rewriter) {
             rewriter.setInsertionPoint(constOp);
             rewriter.replaceOpWithNewOp<arith::ConstantOp>(
                 constOp, DenseElementsAttr::get(resultTensorType,
-                                                dattr.getSplatValue()));
+                                                dattr.getSplatValue<IntegerAttr>()));
           }
         }
         return;
@@ -90,8 +92,8 @@ void eraseTriangularEncoding(Value operand, PatternRewriter &rewriter) {
       // }
 
       auto parent = operand.getParentRegion()->getParentOp();
-      if (parent && dyn_cast_or_null<FuncOp>(parent)) {
-        auto funcOp = dyn_cast<FuncOp>(parent);
+      if (parent && dyn_cast_or_null<func::FuncOp>(parent)) {
+        auto funcOp = dyn_cast<func::FuncOp>(parent);
         SmallVector<Type> argumentTypes;
         int index = 0;
         for (auto arg : funcOp.getArguments()) {
@@ -103,11 +105,11 @@ void eraseTriangularEncoding(Value operand, PatternRewriter &rewriter) {
           index++;
         }
         // funcOp.setType(FunctionType::get(funcOp.getContext(), argumentTypes,
-        //                                  funcOp.getType().getResults()));
-        funcOp.setType(stripEncodingFromFunc(funcOp.getType()));
+        //                                  funcOp.getFunctionType().getResults()));
+        funcOp.setType(stripEncodingFromFunc(funcOp.getFunctionType()));
         auto uses = funcOp.getSymbolUses(funcOp->getParentOfType<ModuleOp>());
-        if (uses.hasValue()) {
-          for (auto use : uses.getValue()) {
+        if (uses.has_value()) {
+          for (auto use : uses.value()) {
             for (auto useOperand : use.getUser()->getOperands()) {
               eraseTriangularEncoding(useOperand, rewriter);
             }
@@ -128,9 +130,12 @@ static void unpackRanges(ArrayRef<Range> ranges, SmallVectorImpl<Value> &lbs,
                          SmallVectorImpl<Value> &ubs,
                          SmallVectorImpl<Value> &steps) {
   for (Range range : ranges) {
-    lbs.emplace_back(range.offset);
-    ubs.emplace_back(range.size);
-    steps.emplace_back(range.stride);
+    if (auto offsetVal = range.offset.dyn_cast<Value>())
+      lbs.push_back(offsetVal);
+    if (auto sizeVal = range.size.dyn_cast<Value>())
+      ubs.push_back(sizeVal);
+    if (auto strideVal = range.stride.dyn_cast<Value>())
+      steps.push_back(strideVal);
   }
 }
 
@@ -147,8 +152,8 @@ static SmallVector<Value> makeCanonicalAffineApplies(OpBuilder &b, Location loc,
   for (auto e : map.getResults()) {
     auto exprMap = AffineMap::get(dims, map.getNumSymbols(), e);
     SmallVector<Value> operands(vals.begin(), vals.end());
-    canonicalizeMapAndOperands(&exprMap, &operands);
-    res.push_back(b.create<AffineApplyOp>(loc, exprMap, operands));
+    affine::canonicalizeMapAndOperands(&exprMap, &operands);
+    res.push_back(b.create<affine::AffineApplyOp>(loc, exprMap, operands));
   }
   return res;
 }
@@ -160,7 +165,7 @@ inlineRegionAndEmitStore(OpBuilder &b, Location loc, linalg::LinalgOp op,
                          ArrayRef<SmallVector<Value>> indexing,
                          ArrayRef<Value> outputTensors) {
   auto &block = op->getRegion(0).front();
-  BlockAndValueMapping map;
+  IRMapping map;
   map.map(block.getArguments(), indexedValues);
   for (auto &op : block.without_terminator()) {
     auto *newOp = b.clone(op, map);
@@ -182,33 +187,33 @@ static SmallVector<Value> emitScalarImplementation(OpBuilder &b, Location loc,
                                                    ValueRange allIvs,
                                                    ValueRange iterArgs,
                                                    linalg::LinalgOp linalgOp) {
-  assert(iterArgs.size() == linalgOp.getOutputTensorOperands().size() &&
+  assert(iterArgs.size() == linalgOp.getDpsInits().size() &&
          "Expected # of iter args to be equal to # of output tensor operands.");
 
   SmallVector<Value> indexedValues;
-  indexedValues.reserve(linalgOp.getNumInputsAndOutputs());
+  indexedValues.reserve(linalgOp.getNumDpsInputs() + linalgOp.getNumDpsInits());
 
   auto allIvsPlusDims = SmallVector<Value>(allIvs.begin(), allIvs.end());
   // 1.a. Emit load from input operands or for scalars access the operand
   // itself.
-  for (auto inputOperand : linalgOp.getInputOperands()) {
+  for (auto inputOperand : linalgOp.getDpsInputOperands()) {
     if (linalgOp.isScalar(inputOperand)) {
       indexedValues.push_back(inputOperand->get());
       continue;
     }
     auto indexing = makeCanonicalAffineApplies(
-        b, loc, linalgOp.getTiedIndexingMap(inputOperand), allIvsPlusDims);
+        b, loc, cast<AffineMapAttr>(linalgOp.getIndexingMaps()[inputOperand->getOperandNumber()]).getValue(), allIvsPlusDims);
     indexedValues.push_back(
         b.create<tensor::ExtractOp>(loc, inputOperand->get(), indexing));
   }
 
   // 1.b. Emit load from output views.
-  for (auto pair : llvm::zip(linalgOp.getOutputOperands(), iterArgs)) {
-    auto outputOperand = std::get<0>(pair);
-    Value iterArg = std::get<1>(pair);
+  for (int64_t i = 0, e = linalgOp.getNumDpsInits(); i < e; ++i) {
+    auto outputOperand = linalgOp.getDpsInitOperand(i);
+    Value iterArg = iterArgs[i];
 
     auto indexing = makeCanonicalAffineApplies(
-        b, loc, linalgOp.getTiedIndexingMap(outputOperand), allIvsPlusDims);
+        b, loc, cast<AffineMapAttr>(linalgOp.getIndexingMaps()[outputOperand->getOperandNumber()]).getValue(), allIvsPlusDims);
     indexedValues.push_back(
         b.create<tensor::ExtractOp>(loc, iterArg, indexing));
   }
@@ -217,9 +222,10 @@ static SmallVector<Value> emitScalarImplementation(OpBuilder &b, Location loc,
   // 3. Emit store.
   SmallVector<Value> outputTensors{iterArgs};
   SmallVector<SmallVector<Value>, 8> indexing;
-  for (auto outputOperand : linalgOp.getOutputTensorOperands()) {
+  for (int64_t i = 0, e = linalgOp.getNumDpsInits(); i < e; ++i) {
+    auto outputOperand = linalgOp.getDpsInitOperand(i);
     indexing.push_back(makeCanonicalAffineApplies(
-        b, loc, linalgOp.getTiedIndexingMap(outputOperand), allIvsPlusDims));
+        b, loc, cast<AffineMapAttr>(linalgOp.getIndexingMaps()[outputOperand->getOperandNumber()]).getValue(), allIvsPlusDims));
   }
   return inlineRegionAndEmitStore(b, loc, linalgOp, indexedValues, indexing,
                                   outputTensors);
@@ -233,7 +239,7 @@ public:
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
     auto linalgOp = dyn_cast_or_null<linalg::LinalgOp>(op);
-    if (!linalgOp || !linalgOp.hasTensorSemantics()) {
+    if (!linalgOp || !linalgOp.hasPureTensorSemantics()) {
       return failure();
     }
     auto genericOp =
@@ -261,31 +267,30 @@ public:
     });
 
     auto loopRanges = linalgOp.createLoopRanges(rewriter, linalgOp.getLoc());
-    auto iteratorTypes =
-        llvm::to_vector<4>(linalgOp.iterator_types().getValue());
+    auto iteratorTypes = linalgOp.getIteratorTypesArray();
     SmallVector<Value, 4> lbs, ubs, steps;
     unpackRanges(loopRanges, lbs, ubs, steps);
-    assert(linalgOp.getOutputTensorOperands().size() > 0 &&
+    assert(linalgOp.getDpsInits().size() > 0 &&
            "Expected at least one tensor result");
     SmallVector<Value> iterArgInitValues;
+    auto initType = linalgOp.getDpsInits().getTypes()[0].cast<ShapedType>();
     Value zero = rewriter.create<arith::ConstantOp>(
         linalgOp.getLoc(),
-        FloatAttr::get(linalgOp.getOutputTensorTypes()[0].getElementType(),
-                       0.0));
-    for (auto outputTensor : linalgOp.getOutputTensorOperands()) {
-      auto outType =
-          outputTensor->get().getType().dyn_cast_or_null<ShapedType>();
+        FloatAttr::get(initType.getElementType(), 0.0));
+    for (int64_t i = 0, e = linalgOp.getNumDpsInits(); i < e; ++i) {
+      Value outputTensor = linalgOp.getDpsInits()[i];
+      auto outType = outputTensor.getType().dyn_cast_or_null<ShapedType>();
       assert(outType && "outType was null");
       // Perhaps a premature optimization. Using an init tensor op results in an
       // extra buffer allocation.
       auto space = rewriter.create<memref::AllocOp>(
           linalgOp.getLoc(),
           MemRefType::get(outType.getShape(), outType.getElementType()));
-      if (linalgOp.payloadUsesValueFromOperand(outputTensor)) {
-        rewriter.create<linalg::FillOp>(linalgOp.getLoc(), zero, space);
+      if (linalgOp.payloadUsesValueFromOperand(linalgOp.getDpsInitOperand(i))) {
+        rewriter.create<linalg::FillOp>(linalgOp.getLoc(), ValueRange{zero}, ValueRange{space.getResult()});
       }
       auto loaded =
-          rewriter.create<memref::TensorLoadOp>(linalgOp.getLoc(), space);
+          rewriter.create<bufferization::ToTensorOp>(linalgOp.getLoc(), space);
 
       iterArgInitValues.push_back(loaded);
     }
@@ -306,7 +311,7 @@ public:
     auto last = loopNest.loops[num_loops - 1];
     last.setUpperBound(loopNest.loops[num_loops - 2].getInductionVar());
 
-    op->replaceAllUsesWith(loopNest.getResults());
+    op->replaceAllUsesWith(loopNest.results);
     rewriter.eraseOp(op);
 
     return success();
@@ -331,11 +336,11 @@ struct TriangularLoopsPass
     auto *context = &getContext();
     ConversionTarget target(*context);
     RewritePatternSet patterns(context);
-    target.addLegalDialect<arith::ArithmeticDialect>();
+    target.addLegalDialect<arith::ArithDialect>();
     target.addLegalDialect<memref::MemRefDialect>();
     target.addLegalDialect<scf::SCFDialect>();
     target.addLegalDialect<tensor::TensorDialect>();
-    target.addLegalOp<linalg::InitTensorOp>();
+    target.addLegalOp<tensor::EmptyOp>();
     target.addLegalOp<linalg::FillOp>();
     target.addLegalOp<linalg::YieldOp>();
 

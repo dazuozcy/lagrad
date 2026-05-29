@@ -3,9 +3,10 @@
  */
 #include "LAGrad/Passes.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/SCF.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -45,12 +46,12 @@ public:
       return failure();
     }
 
-    Value destination = rewriter.create<mlir::memref::AllocOp>(
+    Value destination = rewriter.create<memref::AllocOp>(
         op->getLoc(),
         MemRefType::get(rankedType.getShape(), rankedType.getElementType()));
-    rewriter.create<mlir::AffineForOp>(
+    rewriter.create<affine::AffineForOp>(
         op->getLoc(),
-        /*start=*/0, /*stop=*/rankedType.getShape()[0], /*step=*/1, llvm::None,
+        /*start=*/0, /*stop=*/rankedType.getShape()[0], /*step=*/1, std::nullopt,
         [&](OpBuilder &builder, Location loc, Value value,
             ValueRange regionArgs) {
           // Copied again from the convert-elementwise-to-linalg pass
@@ -65,15 +66,15 @@ public:
                 return type.cast<TensorType>().getElementType();
               }));
           state.addTypes(resultTypes);
-          auto *scalarOp = builder.createOperation(state);
-          builder.create<mlir::AffineStoreOp>(loc, scalarOp->getResult(0),
-                                              destination, value);
-          builder.create<mlir::AffineYieldOp>(loc);
+          auto *scalarOp = builder.create(state);
+          builder.create<affine::AffineStoreOp>(loc, scalarOp->getResult(0),
+                                                destination, value);
+          builder.create<affine::AffineYieldOp>(loc);
         });
     Value result =
-        rewriter.create<mlir::memref::TensorLoadOp>(op->getLoc(), destination);
+        rewriter.create<bufferization::ToTensorOp>(op->getLoc(), destination);
 
-    op->replaceAllUsesWith(llvm::makeArrayRef(result));
+    op->replaceAllUsesWith(ValueRange{result});
     rewriter.eraseOp(op);
     return success();
   }
@@ -86,8 +87,8 @@ private:
     // read from.
     auto definingOp = op->getOperand(arg_index).getDefiningOp();
     if (definingOp &&
-        definingOp->getName().getStringRef() == "std.tensor_load") {
-      return builder.create<mlir::AffineLoadOp>(
+        definingOp->getName().getStringRef() == "bufferization.to_tensor") {
+      return builder.create<affine::AffineLoadOp>(
           loc, op->getOperand(arg_index).getDefiningOp()->getOperand(0), index);
     } else {
       return builder.create<tensor::ExtractOp>(loc, op->getOperand(arg_index),
@@ -98,10 +99,10 @@ private:
 
 struct AffineTarget : public ConversionTarget {
   AffineTarget(MLIRContext &ctx) : ConversionTarget(ctx) {
-    addLegalDialect<mlir::StandardOpsDialect>();
+    addLegalDialect<mlir::func::FuncDialect>();
     addLegalDialect<tensor::TensorDialect>();
     addLegalDialect<mlir::scf::SCFDialect>();
-    addLegalOp<FuncOp>();
+    addLegalOp<func::FuncOp>();
   }
 };
 
@@ -118,7 +119,7 @@ struct ElementwiseToAffineConversionPass
   void runOnOperation() final {
     ConversionTarget target(getContext());
     // target.addLegalOp<ModuleOp, ModuleTerminatorOp>();
-    OwningRewritePatternList patterns(&getContext());
+    RewritePatternSet patterns(&getContext());
     patterns.insert<ElementwiseToAffineLowering>(&getContext());
 
     target.markUnknownOpDynamicallyLegal([](Operation *op) {

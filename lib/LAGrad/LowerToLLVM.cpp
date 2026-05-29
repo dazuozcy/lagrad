@@ -2,15 +2,15 @@
 #include "LAGrad/LAGradDialect.h"
 #include "LAGrad/LAGradOps.h"
 
-#include "mlir/Conversion/ArithmeticToLLVM/ArithmeticToLLVM.h"
+#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
-#include "mlir/Conversion/SCFToStandard/SCFToStandard.h"
-#include "mlir/Conversion/StandardToLLVM/ConvertStandardToLLVM.h"
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -60,8 +60,7 @@ public:
 
     auto sym = getOrInsertAutodiffDecl(rewriter, op, floatType);
     auto const_global = getOrInsertEnzymeConstDecl(rewriter, op);
-    auto llvmI8PtrTy =
-        LLVM::LLVMPointerType::get(IntegerType::get(op->getContext(), 8));
+    auto llvmI8PtrTy = LLVM::LLVMPointerType::get(op->getContext());
     auto enzyme_const_addr = rewriter.create<LLVM::AddressOfOp>(
         op->getLoc(), llvmI8PtrTy, const_global);
 
@@ -74,7 +73,7 @@ public:
     LLVMTypeConverter typeConverter(op->getContext());
 
     for (auto it = result.use_begin(); it != result.use_end(); it++) {
-      auto user = dyn_cast_or_null<CallIndirectOp>(it.getUser());
+      auto user = dyn_cast_or_null<func::CallIndirectOp>(it.getUser());
       assert(user && "Expected user to be a CallIndirectOp");
       // Copy over the arguments for the op
       auto arguments = SmallVector<Value>();
@@ -92,8 +91,7 @@ public:
           assert(memrefType && "Operator marked const was not a MemRef");
         }
         if (memrefType && memrefType.getElementType().isa<FloatType>()) {
-          auto pointeeType =
-              LLVM::LLVMPointerType::get(memrefType.getElementType());
+          auto pointeeType = LLVM::LLVMPointerType::get(op->getContext());
           auto rank = memrefType.getRank();
           // Ignore the first pointer
           arguments.push_back(enzyme_const_addr.getResult());
@@ -105,7 +103,7 @@ public:
           arguments.push_back(rewriter
                                   .create<LLVM::ExtractValueOp>(
                                       user->getLoc(), pointeeType, casted,
-                                      rewriter.getI64ArrayAttr(0))
+                                      ArrayRef<int64_t>{0})
                                   .getResult());
 
           if (constSet.contains(arg_index)) {
@@ -115,7 +113,7 @@ public:
           arguments.push_back(rewriter
                                   .create<LLVM::ExtractValueOp>(
                                       user->getLoc(), pointeeType, casted,
-                                      rewriter.getI64ArrayAttr(1))
+                                      ArrayRef<int64_t>{1})
                                   .getResult());
 
           if (!constSet.contains(arg_index)) {
@@ -131,7 +129,7 @@ public:
                     .getResult(0);
             auto extractShadowOp = rewriter.create<LLVM::ExtractValueOp>(
                 shadow.getLoc(), pointeeType, shadowCasted,
-                rewriter.getI64ArrayAttr(1));
+                ArrayRef<int64_t>{1});
             arguments.push_back(extractShadowOp.getResult());
           }
 
@@ -139,20 +137,20 @@ public:
           arguments.push_back(rewriter
                                   .create<LLVM::ExtractValueOp>(
                                       user->getLoc(), llvmI64Ty, casted,
-                                      rewriter.getI64ArrayAttr(2))
+                                      ArrayRef<int64_t>{2})
                                   .getResult());
           for (int64_t i = 0; i < rank; ++i) {
             arguments.push_back(rewriter
                                     .create<LLVM::ExtractValueOp>(
                                         user->getLoc(), llvmI64Ty, casted,
-                                        rewriter.getI64ArrayAttr({3, i}))
+                                        ArrayRef<int64_t>{3, i})
                                     .getResult());
           }
           for (int64_t i = 0; i < rank; ++i) {
             arguments.push_back(rewriter
                                     .create<LLVM::ExtractValueOp>(
                                         user->getLoc(), llvmI64Ty, casted,
-                                        rewriter.getI64ArrayAttr({4, i}))
+                                        ArrayRef<int64_t>{4, i})
                                     .getResult());
           }
         } else {
@@ -161,7 +159,7 @@ public:
         arg_index++;
       }
 
-      rewriter.replaceOpWithNewOp<CallOp>(user, sym, primalType.getResults(),
+      rewriter.replaceOpWithNewOp<func::CallOp>(user, sym, primalType.getResults(),
                                           arguments);
     }
 
@@ -197,7 +195,7 @@ private:
     }
 
     // Create the function declaration for __enzyme_autodiff
-    auto voidPtrType = LLVM::LLVMPointerType::get(IntegerType::get(context, 8));
+    auto voidPtrType = LLVM::LLVMPointerType::get(context);
 
     auto llvmFnType =
         LLVM::LLVMFunctionType::get(returnType, voidPtrType, /*isVarArg=*/true);
@@ -236,11 +234,11 @@ void StandaloneToLLVMLoweringPass::runOnOperation() {
 
   LLVMTypeConverter typeConverter(&getContext());
 
-  OwningRewritePatternList patterns(&getContext());
-  populateLoopToStdConversionPatterns(patterns);
-  populateMemRefToLLVMConversionPatterns(typeConverter, patterns);
-  arith::populateArithmeticToLLVMConversionPatterns(typeConverter, patterns);
-  populateStdToLLVMConversionPatterns(typeConverter, patterns);
+  RewritePatternSet patterns(&getContext());
+  populateSCFToControlFlowConversionPatterns(patterns);
+  populateFinalizeMemRefToLLVMConversionPatterns(typeConverter, patterns);
+  arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);
+  populateFuncToLLVMConversionPatterns(typeConverter, patterns);
   patterns.insert<DiffOpLowering>(&getContext());
 
   auto mod = getOperation();

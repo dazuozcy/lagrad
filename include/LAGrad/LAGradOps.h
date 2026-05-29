@@ -9,6 +9,7 @@
 #ifndef LAGRAD_LAGRADOPS_H
 #define LAGRAD_LAGRADOPS_H
 
+#include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpDefinition.h"
