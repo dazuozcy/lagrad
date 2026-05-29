@@ -2,17 +2,17 @@
  * A custom pass meant to fill gaps in bufferizing tensor ops.
  * Motivated by a lack of bufferization for the tensor.insert op.
  */
-#include "mlir/Transforms/Bufferize.h"
+#include "mlir/Dialect/Bufferization/Transforms/Bufferize.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "LAGrad/Analysis.h"
 #include "LAGrad/Logger.h"
 #include "LAGrad/Passes.h"
 #include "LAGrad/Utils.h"
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
-#include "mlir/Dialect/Linalg/IR/LinalgOps.h"
-#include "mlir/Dialect/Linalg/Transforms/ComprehensiveBufferize.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/SCF.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/Passes.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -25,29 +25,43 @@ using llvm::errs;
 constexpr bool force_copy = false;
 
 namespace {
+class BufferizeTypeConverter : public TypeConverter {
+public:
+  BufferizeTypeConverter() {
+    addConversion([](Type type) { return type; });
+    addConversion([](RankedTensorType type) -> Type {
+      return MemRefType::get(type.getShape(), type.getElementType());
+    });
+  }
+};
+} // namespace
+
+namespace {
 
 void bufferizeLinalgOp(linalg::LinalgOp linalgOp, ValueRange outputBuffers,
-                       ValueRange results, TypeConverter &typeConverter,
+                       ValueRange results, const TypeConverter &typeConverter,
                        ConversionPatternRewriter &rewriter) {
   PatternRewriter::InsertionGuard g(rewriter);
   rewriter.setInsertionPoint(linalgOp);
 
   SmallVector<Value> newOperands;
-  newOperands.reserve(linalgOp.getNumInputsAndOutputs());
-  for (OpOperand *inputOperand : linalgOp.getInputTensorOperands()) {
-    newOperands.push_back(rewriter.create<memref::BufferCastOp>(
+  newOperands.reserve(linalgOp.getNumDpsInputs() + linalgOp.getNumDpsInits());
+  for (OpOperand *inputOperand : linalgOp.getDpsInputOperands()) {
+    newOperands.push_back(rewriter.create<bufferization::ToMemrefOp>(
         linalgOp.getLoc(),
-        typeConverter.convertType(inputOperand->get().getType()),
+        typeConverter.convertType(inputOperand->get().getType()).cast<MemRefType>(),
         inputOperand->get()));
   }
   newOperands.append(outputBuffers.begin(), outputBuffers.end());
 
   assert(linalgOp->getNumRegions() == 1 &&
          "expected linalg op to have 1 region");
-  auto newOp = cast<linalg::LinalgOp>(linalgOp.cloneWithoutRegions(
-      rewriter, linalgOp.getLoc(), TypeRange{}, newOperands));
-  rewriter.inlineRegionBefore(linalgOp->getRegion(0), newOp->getRegion(0),
-                              newOp->getRegion(0).begin());
+  OperationState state(linalgOp.getLoc(), linalgOp->getName());
+  state.addOperands(newOperands);
+  state.addTypes(TypeRange{});
+  state.addAttributes(linalgOp->getAttrs());
+  auto newOp = cast<linalg::LinalgOp>(rewriter.create(state));
+  newOp->getRegion(0).takeBody(linalgOp->getRegion(0));
 
   // The number of output buffers should always be 1 for now.
   rewriter.replaceOp(linalgOp, results);
@@ -76,30 +90,30 @@ public:
                           ->convertType(extractSliceOp.getSourceType())
                           .cast<MemRefType>();
 
-    auto resultType = eraseStridedLayout(
+    auto resultType =
         memref::SubViewOp::inferRankReducedResultType(
             sliceType.getRank(), sourceType, extractSliceOp.getMixedOffsets(),
             extractSliceOp.getMixedSizes(), extractSliceOp.getMixedStrides())
-            .cast<MemRefType>());
+            .cast<MemRefType>();
     auto identityResultType =
         getTypeConverter()->convertType(sliceType).cast<MemRefType>();
-    auto source = rewriter.create<memref::BufferCastOp>(
-        op->getLoc(), sourceType, extractSliceOp.source());
+    auto source = rewriter.create<bufferization::ToMemrefOp>(
+        op->getLoc(), sourceType, extractSliceOp.getSource());
     auto subview = rewriter.create<memref::SubViewOp>(
         op->getLoc(), resultType, source, extractSliceOp.getMixedOffsets(),
         extractSliceOp.getMixedSizes(), extractSliceOp.getMixedStrides());
     auto casted = rewriter.create<memref::CastOp>(
-        op->getLoc(), subview.getResult(), identityResultType);
-    auto loaded = rewriter.create<memref::TensorLoadOp>(op->getLoc(), casted);
+        op->getLoc(), identityResultType, subview.getResult());
+    auto loaded = rewriter.create<bufferization::ToTensorOp>(op->getLoc(), casted);
     rewriter.replaceOp(op, loaded.getResult());
-    rewriter.replaceOp(insertSliceOp, extractSliceOp.source());
+    rewriter.replaceOp(insertSliceOp, extractSliceOp.getSource());
 
     // Need to ensure linalg ops that write to the extractSliceOp are bufferized
     // in-place.
     for (auto &use : extractSliceOp.getResult().getUses()) {
       if (ieAnalysis.isLinalgMarkedForBufferization(use.getOwner())) {
         auto linalgOp = dyn_cast<linalg::LinalgOp>(use.getOwner());
-        if (linalgOp.isOutputTensor(&use)) {
+        if (linalgOp.isInitTensor(&use)) {
           bufferizeLinalgOp(linalgOp, /*outputBuffers=*/subview.getResult(),
                             /*results=*/loaded.getResult(), *getTypeConverter(),
                             rewriter);
@@ -131,15 +145,16 @@ public:
       : OpConversionPattern(typeConverter, ctx, /*benefit=*/1) {}
 
   LogicalResult
-  matchAndRewrite(linalg::FillOp op, ArrayRef<Value> operands,
+  matchAndRewrite(linalg::FillOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     if (op.getNumResults() != 1) {
       return failure();
     }
 
-    bool mustCopy = !hasUseAfter(op.output(), op.getResult(0));
+    Value outputVal = op.getDpsInitOperand(0)->get();
+    bool mustCopy = !hasUseAfter(outputVal, op.getResult(0));
     if (mustCopy) {
-      auto outputType = op.output().getType().cast<ShapedType>();
+      auto outputType = outputVal.getType().cast<ShapedType>();
       if (!outputType.hasStaticShape()) {
         return failure();
       }
@@ -154,13 +169,13 @@ public:
 
       Value copy = rewriter.create<memref::AllocOp>(
           op.getLoc(), getTypeConverter()
-                           ->convertType(op.output().getType())
+                           ->convertType(outputVal.getType())
                            .cast<MemRefType>());
-      rewriter.create<linalg::FillOp>(op.getLoc(), op.value(), copy);
+      rewriter.create<linalg::FillOp>(op.getLoc(), adaptor.getInputs()[0], copy);
       rewriter.replaceOp(op, copy);
     } else {
-      rewriter.create<linalg::FillOp>(op.getLoc(), operands[0], operands[1]);
-      rewriter.replaceOp(op, operands[1]);
+      rewriter.create<linalg::FillOp>(op.getLoc(), adaptor.getInputs()[0], adaptor.getOutputs()[0]);
+      rewriter.replaceOp(op, adaptor.getOutputs()[0]);
     }
     return success();
   }
@@ -172,13 +187,13 @@ public:
   LogicalResult
   matchAndRewrite(tensor::InsertOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    memref::TensorLoadOp loaded;
+    bufferization::ToTensorOp loaded;
 
     // This is very naïve.
     DominanceInfo dom;
     bool hasUseAfter = false;
 
-    for (auto user : op.dest().getUsers()) {
+    for (auto user : op.getDest().getUsers()) {
       if (dom.properlyDominates(op.getResult(), user)) {
         hasUseAfter = true;
       }
@@ -188,17 +203,17 @@ public:
     if (!hasUseAfter && !force_copy) {
       // This first implementation updates the tensor in place rather than
       // returning a copy per the spec. Watch out for bugs this may cause.
-      rewriter.create<memref::StoreOp>(op.getLoc(), adaptor.scalar(),
-                                       adaptor.dest(), adaptor.indices());
+      rewriter.create<memref::StoreOp>(op.getLoc(), adaptor.getScalar(),
+                                       adaptor.getDest(), adaptor.getIndices());
       loaded =
-          rewriter.create<memref::TensorLoadOp>(op.getLoc(), adaptor.dest());
+          rewriter.create<bufferization::ToTensorOp>(op.getLoc(), adaptor.getDest());
     } else {
       auto space = rewriter.create<memref::AllocOp>(
-          op.getLoc(), adaptor.dest().getType().cast<MemRefType>());
-      rewriter.create<linalg::CopyOp>(op.getLoc(), adaptor.dest(), space);
-      rewriter.create<memref::StoreOp>(op.getLoc(), adaptor.scalar(), space,
-                                       adaptor.indices());
-      loaded = rewriter.create<memref::TensorLoadOp>(op.getLoc(), space);
+          op.getLoc(), adaptor.getDest().getType().cast<MemRefType>());
+      rewriter.create<linalg::CopyOp>(op.getLoc(), ValueRange{adaptor.getDest()}, ValueRange{space});
+      rewriter.create<memref::StoreOp>(op.getLoc(), adaptor.getScalar(), space,
+                                       adaptor.getIndices());
+      loaded = rewriter.create<bufferization::ToTensorOp>(op.getLoc(), space);
     }
 
     op.replaceAllUsesWith(loaded.getResult());
@@ -238,22 +253,22 @@ public:
         op.getOffsetSizeAndStrideStartOperandIndex() != 1) {
       return failure();
     }
-    auto sourceType = adaptor.source().getType().cast<MemRefType>();
-    Value source = adaptor.source();
+    auto sourceType = adaptor.getSource().getType().cast<MemRefType>();
+    Value source = adaptor.getSource();
     // Ugly, brittle hack to get extract_slice with compressed GMMs working.
     // This results in the source having a fully dynamic layout map, which is
     // okay, but partial bufferization appears to expect an identity layout
     // map at the end of this transformation.
     if (sourceType.getDimSize(sourceType.getRank() - 1) == 1) {
       source = rewriter.create<memref::CastOp>(
-          op.getLoc(), eraseStridedLayout(sourceType), source);
+          op.getLoc(), sourceType, source);
     }
 
     auto resultType =
-        eraseStridedLayout(memref::SubViewOp::inferRankReducedResultType(
-                               resultRank, sourceType, op.getMixedOffsets(),
-                               op.getMixedSizes(), op.getMixedStrides())
-                               .cast<MemRefType>());
+        memref::SubViewOp::inferRankReducedResultType(
+            resultRank, sourceType, op.getMixedOffsets(),
+            op.getMixedSizes(), op.getMixedStrides())
+            .cast<MemRefType>();
     auto identityResultType =
         getTypeConverter()->convertType(resultTensorType).cast<MemRefType>();
 
@@ -264,7 +279,7 @@ public:
     DominanceInfo dom;
     bool hasWriteAfter = false;
 
-    for (auto user : op.source().getUsers()) {
+    for (auto user : op.getSource().getUsers()) {
       if (dom.properlyDominates(op.getResult(), user)) {
         hasWriteAfter = true;
       }
@@ -274,7 +289,7 @@ public:
     // This causes a slow-down with GMM/main term, have yet to look into why.
 
     // This is a coarse-grained heuristic.
-    // SmallVector<Value> frontier{op.source()};
+    // SmallVector<Value> frontier{op.getSource()};
     // ValueSet derivedFromSource;
     // runTopDownDFS(frontier, derivedFromSource);
     // for (Value derivedValue : derivedFromSource) {
@@ -286,14 +301,14 @@ public:
     //   }
     // }
     if (!hasWriteAfter && !force_copy) {
-      // rewriter.replaceOpWithNewOp<memref::TensorLoadOp>(op,
+      // rewriter.replaceOpWithNewOp<bufferization::ToTensorOp>(op,
       //                                                   subview.getResult());
-      rewriter.replaceOpWithNewOp<memref::CastOp>(op, subview.getResult(),
-                                                  identityResultType);
+      rewriter.replaceOpWithNewOp<memref::CastOp>(op, identityResultType,
+                                                  subview.getResult());
     } else {
       auto dest =
           rewriter.create<memref::AllocOp>(op.getLoc(), identityResultType);
-      rewriter.create<linalg::CopyOp>(op.getLoc(), subview, dest);
+      rewriter.create<linalg::CopyOp>(op.getLoc(), ValueRange{subview.getResult()}, ValueRange{dest});
       rewriter.replaceOp(op, dest.getResult());
     }
     return success();
@@ -323,7 +338,7 @@ public:
     DominanceInfo dom;
     bool hasUseAfter = false;
 
-    for (auto user : op.dest().getUsers()) {
+    for (auto user : op.getDest().getUsers()) {
       if (dom.properlyDominates(op.getResult(), user)) {
         hasUseAfter = true;
       }
@@ -332,24 +347,24 @@ public:
     auto sliceType =
         memref::SubViewOp::inferRankReducedResultType(
             op.getSourceType().getRank(),
-            adaptor.dest().getType().cast<MemRefType>(), op.getMixedOffsets(),
+            adaptor.getDest().getType().cast<MemRefType>(), op.getMixedOffsets(),
             op.getMixedSizes(), op.getMixedStrides())
             .cast<MemRefType>();
     if (!hasUseAfter) {
       auto subview = rewriter.create<memref::SubViewOp>(
-          op.getLoc(), sliceType, adaptor.dest(), op.getMixedOffsets(),
+          op.getLoc(), sliceType, adaptor.getDest(), op.getMixedOffsets(),
           op.getMixedSizes(), op.getMixedStrides());
-      rewriter.create<linalg::CopyOp>(op.getLoc(), adaptor.source(), subview);
-      rewriter.replaceOp(op, adaptor.dest());
+      rewriter.create<linalg::CopyOp>(op.getLoc(), ValueRange{adaptor.getSource()}, ValueRange{subview.getResult()});
+      rewriter.replaceOp(op, adaptor.getDest());
     } else {
       auto dest = rewriter.create<memref::AllocOp>(
-          op.getLoc(), adaptor.dest().getType().dyn_cast<MemRefType>());
-      rewriter.create<linalg::CopyOp>(op.getLoc(), adaptor.dest(), dest);
+          op.getLoc(), adaptor.getDest().getType().dyn_cast<MemRefType>());
+      rewriter.create<linalg::CopyOp>(op.getLoc(), ValueRange{adaptor.getDest()}, ValueRange{dest});
       auto subview = rewriter.create<memref::SubViewOp>(
           op.getLoc(), sliceType, dest, op.getMixedOffsets(),
           op.getMixedSizes(), op.getMixedStrides());
 
-      rewriter.create<linalg::CopyOp>(op.getLoc(), adaptor.source(), subview);
+      rewriter.create<linalg::CopyOp>(op.getLoc(), ValueRange{adaptor.getSource()}, ValueRange{subview.getResult()});
       rewriter.replaceOp(op, dest.getResult());
     }
     return success();
@@ -363,23 +378,23 @@ public:
   LogicalResult
   matchAndRewrite(linalg::LinalgOp op, ArrayRef<Value> operands,
                   ConversionPatternRewriter &rewriter) const override {
-    if (op.hasBufferSemantics()) {
+    if (op.hasPureBufferSemantics()) {
       return failure();
     }
     DominanceInfo dom;
     bool hasUseAfter = false;
-    for (auto user : op.getOutputOperand(0)->get().getUsers()) {
+    for (auto user : op.getDpsInitOperand(0)->get().getUsers()) {
       if (dom.properlyDominates(op->getResult(0), user)) {
         hasUseAfter = true;
       }
     }
     SmallVector<Value> newOperands{operands.begin(), operands.end()};
     Operation *parentOp =
-        op.getOutputOperand(0)->get().getDefiningOp()
-            ?: op.getOutputOperand(0)->get().getParentRegion()->getParentOp();
+        op.getDpsInitOperand(0)->get().getDefiningOp()
+            ?: op.getDpsInitOperand(0)->get().getParentRegion()->getParentOp();
     bool isImmutableArg = false;
-    if (auto funcOp = dyn_cast<FuncOp>(parentOp)) {
-      auto blockArg = op.getOutputOperand(0)->get().cast<BlockArgument>();
+    if (auto funcOp = dyn_cast<func::FuncOp>(parentOp)) {
+      auto blockArg = op.getDpsInitOperand(0)->get().cast<BlockArgument>();
       // Function arguments are immutable by default.
       isImmutableArg = !static_cast<bool>(
           funcOp.getArgAttr(blockArg.getArgNumber(), "linalg.mutable"));
@@ -387,15 +402,15 @@ public:
     bool isConstantMemory = isa_and_nonnull<arith::ConstantOp>(parentOp);
     bool mustCopy = hasUseAfter || isConstantMemory || isImmutableArg;
 
-    assert(op.getNumOutputs() == 1);
+    assert(op.getNumDpsInits() == 1);
     if (mustCopy) {
       errs() << "Analysis determined we must copy: hasUseAfter " << hasUseAfter
              << " isConstantMemory: " << isConstantMemory
              << " isImmutableArg: " << isImmutableArg << "\n";
       auto space = rewriter.create<memref::AllocOp>(
           op.getLoc(), newOperands.back().getType().cast<MemRefType>());
-      rewriter.create<linalg::CopyOp>(op.getLoc(), newOperands.back(), space);
-      newOperands[newOperands.size() - 1] = space;
+      rewriter.create<linalg::CopyOp>(op.getLoc(), ValueRange{newOperands.back()}, ValueRange{space.getResult()});
+      newOperands[newOperands.size() - 1] = space.getResult();
     } else {
       op.emitRemark() << "Made in-place update";
     }
@@ -404,13 +419,15 @@ public:
     Operation *unknownOp = op;
     auto linalgOp = cast<linalg::LinalgOp>(unknownOp);
     assert(op->getNumRegions() == 1 && "expected linalg op to have 1 region");
-    auto newOp = cast<linalg::LinalgOp>(linalgOp.cloneWithoutRegions(
-        rewriter, op.getLoc(), TypeRange{}, newOperands));
-    rewriter.inlineRegionBefore(op->getRegion(0), newOp->getRegion(0),
-                                newOp->getRegion(0).begin());
-    for (auto outputBuffer : newOp.getOutputBufferOperands()) {
-      results.push_back(rewriter.create<memref::TensorLoadOp>(
-          op.getLoc(), outputBuffer->get()));
+    OperationState state(op.getLoc(), op->getName());
+    state.addOperands(newOperands);
+    state.addTypes(TypeRange{});
+    state.addAttributes(op->getAttrs());
+    auto newOp = cast<linalg::LinalgOp>(rewriter.create(state));
+    newOp->getRegion(0).takeBody(op->getRegion(0));
+    for (int64_t i = 0, e = newOp.getNumDpsInits(); i < e; ++i) {
+      results.push_back(rewriter.create<bufferization::ToTensorOp>(
+          op.getLoc(), newOp.getDpsInitOperand(i)->get()));
     }
 
     rewriter.replaceOp(op, results);
@@ -455,8 +472,8 @@ struct StandaloneBufferizePass : public OperationPass<ModuleOp> {
       ieAnalysis.disableAnalysis();
 
     target.addLegalDialect<memref::MemRefDialect>();
-    target.addDynamicallyLegalDialect<arith::ArithmeticDialect,
-                                      StandardOpsDialect>([&](Operation *op) {
+    target.addDynamicallyLegalDialect<arith::ArithDialect,
+                                      func::FuncDialect>([&](Operation *op) {
       return typeConverter.isLegal(op) || isa<arith::ConstantOp>(op);
     });
     target.addDynamicallyLegalDialect<linalg::LinalgDialect>(
@@ -465,17 +482,17 @@ struct StandaloneBufferizePass : public OperationPass<ModuleOp> {
                  !ieAnalysis.isLinalgMarkedForBufferization(op);
         });
     target.addDynamicallyLegalOp<linalg::FillOp>([](linalg::FillOp op) {
-      return op.hasBufferSemantics() || op.getNumResults() != 1 ||
-             !op.output().getType().cast<ShapedType>().hasStaticShape();
+      return op.hasPureBufferSemantics() || op.getNumResults() != 1 ||
+             !op.getDpsInitOperand(0)->get().getType().cast<ShapedType>().hasStaticShape();
     });
-    target.addLegalOp<CallOp>();
-    target.addLegalOp<ReturnOp>();
+    target.addLegalOp<func::CallOp>();
+    target.addLegalOp<func::ReturnOp>();
     target.addLegalOp<linalg::CopyOp>();
     target.addLegalOp<linalg::YieldOp>();
-    target.addLegalOp<linalg::InitTensorOp>();
+    target.addLegalOp<tensor::EmptyOp>();
     target.addIllegalOp<tensor::InsertOp>();
     target.addLegalDialect<scf::SCFDialect>();
-    populateBufferizeMaterializationLegality(target);
+    target.addLegalDialect<bufferization::BufferizationDialect>();
 
     patterns.add<BufferizeInsertOp>(typeConverter, patterns.getContext());
     patterns.add<BufferizeInsertExtractPair>(ieAnalysis, typeConverter,

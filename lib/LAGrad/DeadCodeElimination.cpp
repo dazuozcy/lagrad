@@ -4,14 +4,15 @@
  */
 #include "LAGrad/Passes.h"
 #include "LAGrad/Utils.h"
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
-#include "mlir/Dialect/Linalg/IR/LinalgOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/SCF.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/Passes.h"
-#include "mlir/Transforms/Bufferize.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Bufferization/Transforms/Bufferize.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
@@ -46,7 +47,7 @@ void BFS(ValueRange start, llvm::SmallDenseSet<Value> &liveValues) {
 void populateLiveBodyArgs(scf::ForOp forOp,
                           llvm::SmallDenseSet<Value> &liveValues) {
   auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-  for (auto it : llvm::zip(yieldOp.results(), forOp.getResults(),
+  for (auto it : llvm::zip(yieldOp.getOperands(), forOp.getResults(),
                            forOp.getRegionIterArgs())) {
     auto yieldResult = std::get<0>(it);
     auto result = std::get<1>(it);
@@ -54,11 +55,12 @@ void populateLiveBodyArgs(scf::ForOp forOp,
     if (!result.use_empty()) {
       BFS(yieldResult, liveValues);
     } else {
-      SmallVector<Value> frontier{iterArg};
+      SmallVector<Value> frontier;
+      frontier.push_back(iterArg);
       ValueSet derivedFromIterArg;
       runTopDownDFS(frontier, derivedFromIterArg);
       for (auto derived : derivedFromIterArg) {
-        if (dyn_cast_or_null<memref::BufferCastOp>(derived.getDefiningOp())) {
+        if (dyn_cast_or_null<bufferization::ToMemrefOp>(derived.getDefiningOp())) {
           liveValues.insert(iterArg);
           break;
         }
@@ -85,7 +87,7 @@ public:
     }
 
     bool canonicalize = false;
-    Block &block = forOp.region().front();
+    Block &block = forOp.getRegion().front();
     auto yieldOp = cast<scf::YieldOp>(block.getTerminator());
 
     llvm::SmallDenseSet<Value> liveSet;
@@ -93,18 +95,18 @@ public:
     // An internal flat vector of block transfer
     // arguments `newBlockTransferArgs` keeps the 1-1 mapping of original to
     // transformed block argument mappings. This plays the role of a
-    // BlockAndValueMapping for the particular use case of calling into
+    // IRMapping for the particular use case of calling into
     // `mergeBlockBefore`.
     SmallVector<bool, 4> keepMask;
     keepMask.reserve(yieldOp.getNumOperands());
     SmallVector<Value, 4> newBlockTransferArgs, newIterArgs, newYieldValues,
         newResultValues;
-    newBlockTransferArgs.reserve(1 + forOp.getNumIterOperands());
+    newBlockTransferArgs.reserve(1 + forOp.getNumRegionIterArgs());
     newBlockTransferArgs.push_back(Value()); // iv placeholder with null value
-    newIterArgs.reserve(forOp.getNumIterOperands());
+    newIterArgs.reserve(forOp.getNumRegionIterArgs());
     newYieldValues.reserve(yieldOp.getNumOperands());
     newResultValues.reserve(forOp.getNumResults());
-    for (auto it : llvm::zip(forOp.getIterOperands(),   // iter from outside
+    for (auto it : llvm::zip(forOp.getInitArgs(),   // iter from outside
                              forOp.getRegionIterArgs(), // iter inside region
                              forOp.getResults(),        // op results
                              yieldOp.getOperands()      // iter yield
@@ -131,9 +133,9 @@ public:
       return failure();
 
     scf::ForOp newForOp = rewriter.create<scf::ForOp>(
-        forOp.getLoc(), forOp.lowerBound(), forOp.upperBound(), forOp.step(),
+        forOp.getLoc(), forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
         newIterArgs);
-    Block &newBlock = newForOp.region().front();
+    Block &newBlock = newForOp.getRegion().front();
 
     // Replace the null placeholders with newly constructed values.
     newBlockTransferArgs[0] = newBlock.getArgument(0); // iv
@@ -149,7 +151,7 @@ public:
       }
     }
 
-    Block &oldBlock = forOp.region().front();
+    Block &oldBlock = forOp.getRegion().front();
     assert(oldBlock.getNumArguments() == newBlockTransferArgs.size() &&
            "unexpected argument size mismatch");
 
@@ -158,7 +160,7 @@ public:
     // original terminator that has been merged in.
     if (newIterArgs.empty()) {
       auto newYieldOp = cast<scf::YieldOp>(newBlock.getTerminator());
-      rewriter.mergeBlockBefore(&oldBlock, newYieldOp, newBlockTransferArgs);
+      rewriter.inlineBlockBefore(&oldBlock, newYieldOp, newBlockTransferArgs);
       rewriter.eraseOp(newBlock.getTerminator()->getPrevNode());
       rewriter.replaceOp(forOp, newResultValues);
       return success();
@@ -201,7 +203,7 @@ struct StandaloneDCEPass
     auto *context = &getContext();
     RewritePatternSet patterns(context);
     patterns.add<EliminateUnusedSCFForOpResults>(patterns.getContext());
-    if (failed(applyPatternsAndFoldGreedily(getOperation()->getRegions(),
+    if (failed(applyPatternsAndFoldGreedily(getOperation(),
                                             std::move(patterns)))) {
       signalPassFailure();
     }

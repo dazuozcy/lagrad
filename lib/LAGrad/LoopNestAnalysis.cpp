@@ -7,14 +7,14 @@ Value getInductionVar(scf::ForOp op, LoopNest &loopNest) {
     if (auto subiOp =
             dyn_cast<arith::SubIOp>(*op.getInductionVar().getUsers().begin())) {
       // case 1: (ub - iv) - 1
-      if (subiOp.lhs() == op.upperBound() &&
-          subiOp.rhs() == op.getInductionVar() &&
+      if (subiOp.getLhs() == op.getUpperBound() &&
+          subiOp.getRhs() == op.getInductionVar() &&
           subiOp.getResult().hasOneUse()) {
         if (auto secondSubiOp = dyn_cast<arith::SubIOp>(
                 *subiOp.getResult().getUsers().begin())) {
           auto rhs = dyn_cast_or_null<arith::ConstantIndexOp>(
-              secondSubiOp.rhs().getDefiningOp());
-          if (secondSubiOp.lhs() == subiOp.getResult() && rhs &&
+              secondSubiOp.getRhs().getDefiningOp());
+          if (secondSubiOp.getLhs() == subiOp.getResult() && rhs &&
               rhs.value() == 1) {
             loopNest.ivComputation.insert(subiOp);
             loopNest.ivComputation.insert(secondSubiOp);
@@ -24,10 +24,10 @@ Value getInductionVar(scf::ForOp op, LoopNest &loopNest) {
       } else {
         // case 2: (const ub - 1) - iv
         auto constLHS = dyn_cast_or_null<arith::ConstantIndexOp>(
-            subiOp.lhs().getDefiningOp());
+            subiOp.getLhs().getDefiningOp());
         auto constUpperBound = dyn_cast_or_null<arith::ConstantIndexOp>(
-            op.upperBound().getDefiningOp());
-        if (subiOp.rhs() == op.getInductionVar() && constLHS &&
+            op.getUpperBound().getDefiningOp());
+        if (subiOp.getRhs() == op.getInductionVar() && constLHS &&
             constUpperBound &&
             constLHS.value() == constUpperBound.value() - 1) {
           loopNest.ivComputation.insert(subiOp);
@@ -40,7 +40,7 @@ Value getInductionVar(scf::ForOp op, LoopNest &loopNest) {
 }
 
 using llvm::errs;
-Optional<std::pair<Value, Value>> traverseTiedLoopOperands(Value regionArg) {
+std::optional<std::pair<Value, Value>> traverseTiedLoopOperands(Value regionArg) {
   // errs() << "traversing tied loop operands for region arg " << regionArg
   //        << "\n";
   Value tensor = regionArg;
@@ -48,26 +48,26 @@ Optional<std::pair<Value, Value>> traverseTiedLoopOperands(Value regionArg) {
   while (auto parentForOp =
              dyn_cast<scf::ForOp>(tensor.getParentRegion()->getParentOp())) {
     OpOperand *iterOperand =
-        llvm::find_if(parentForOp.getIterOpOperands(), [&](OpOperand &operand) {
-          return parentForOp.getRegionIterArgForOpOperand(operand) == tensor;
+        llvm::find_if(parentForOp.getInitArgsMutable(), [&](OpOperand &operand) {
+          return parentForOp.getTiedLoopResult(&operand) == tensor;
         });
-    if (iterOperand == parentForOp.getIterOpOperands().end()) {
-      return llvm::None;
+    if (iterOperand == parentForOp.getInitArgsMutable().end()) {
+      return std::nullopt;
     }
     tensor = iterOperand->get();
-    result = parentForOp.getResultForOpOperand(*iterOperand);
+    result = parentForOp.getTiedLoopResult(&*iterOperand);
   }
   return std::make_pair(tensor, result);
 }
 
 bool isPaired(tensor::ExtractOp read, tensor::InsertOp write) {
-  if (!(read.tensor() == write.dest() && read.indices() == write.indices())) {
+  if (!(read.getTensor() == write.getDest() && read.getIndices() == write.getIndices())) {
     return false;
   }
 
   // The read tensor should only be used by the write.
   DominanceInfo dom;
-  for (Operation *user : read.tensor().getUsers()) {
+  for (Operation *user : read.getTensor().getUsers()) {
     if (dom.properlyDominates(read.getResult(), user) && user != write) {
       return false;
     }
@@ -75,9 +75,9 @@ bool isPaired(tensor::ExtractOp read, tensor::InsertOp write) {
   return true;
 }
 
-Optional<LoopNest> parseLoopNest(scf::ForOp op) {
+std::optional<LoopNest> parseLoopNest(scf::ForOp op) {
   if (op->getParentOfType<scf::ForOp>()) {
-    return llvm::None;
+    return std::nullopt;
   }
 
   LoopNest loopNest;
@@ -110,7 +110,7 @@ Optional<LoopNest> parseLoopNest(scf::ForOp op) {
         }
         // need to find all the reads that affect the scalar within the loop
         // body
-        SmallVector<Value> frontier{insertOp.scalar()};
+        SmallVector<Value> frontier{insertOp.getScalar()};
         while (!frontier.empty()) {
           Value val = frontier.pop_back_val();
           if (Operation *definingOp = val.getDefiningOp()) {
@@ -128,30 +128,30 @@ Optional<LoopNest> parseLoopNest(scf::ForOp op) {
 
         for (Operation *read : activeReads) {
           auto extractOp = cast<tensor::ExtractOp>(read);
-          if (extractOp.tensor() == insertOp.dest()) {
+          if (extractOp.getTensor() == insertOp.getDest()) {
             // This extract op is an output operand
             tensor::InsertOp tmpInsert = insertOp;
             unsigned numWrites = 1;
             while (auto prevWrite = dyn_cast_or_null<tensor::InsertOp>(
-                       tmpInsert.dest().getDefiningOp())) {
+                       tmpInsert.getDest().getDefiningOp())) {
               tmpInsert = prevWrite;
               numWrites++;
             }
 
-            loopNest.outputRegionArgs.push_back(tmpInsert.dest());
+            loopNest.outputRegionArgs.push_back(tmpInsert.getDest());
             loopNest.outputPerIterWrites.push_back(numWrites);
             auto maybeOutputOperand =
-                traverseTiedLoopOperands(tmpInsert.dest());
-            if (!maybeOutputOperand.hasValue()) {
+                traverseTiedLoopOperands(tmpInsert.getDest());
+            if (!maybeOutputOperand.has_value()) {
               // errs() << "interrupt output\n";
               return WalkResult::interrupt();
             }
             loopNest.outputTensorOperands.push_back(
-                maybeOutputOperand.getValue().first);
-            loopNest.results.push_back(maybeOutputOperand.getValue().second);
+                maybeOutputOperand.value().first);
+            loopNest.results.push_back(maybeOutputOperand.value().second);
           } else {
             SmallVector<AffineExpr, 4> resultExprs;
-            for (Value idxVal : extractOp.indices()) {
+            for (Value idxVal : extractOp.getIndices()) {
               ptrdiff_t idx = std::distance(
                   loopNest.inductionVars.begin(),
                   std::find(loopNest.inductionVars.begin(),
@@ -179,14 +179,14 @@ Optional<LoopNest> parseLoopNest(scf::ForOp op) {
             // TODO: This analysis is super prototypal, it just needs to work
             // for the hand offline benchmark.
             if (auto tmpInsert = dyn_cast_or_null<tensor::InsertOp>(
-                    extractOp.tensor().getDefiningOp())) {
+                    extractOp.getTensor().getDefiningOp())) {
               while (auto prevWrite = dyn_cast_or_null<tensor::InsertOp>(
-                         tmpInsert.dest().getDefiningOp())) {
+                         tmpInsert.getDest().getDefiningOp())) {
                 tmpInsert = prevWrite;
               }
               if (llvm::none_of(forOp.getRegionIterArgs(),
                                 [&tmpInsert](BlockArgument iterArg) {
-                                  return tmpInsert.dest() == iterArg;
+                                  return tmpInsert.getDest() == iterArg;
                                 })) {
                 // The active read was not a result of a loop region arg.
                 return WalkResult::interrupt();
@@ -194,23 +194,23 @@ Optional<LoopNest> parseLoopNest(scf::ForOp op) {
             } else {
               if (std::find(loopNest.inputRegionArgs.begin(),
                             loopNest.inputRegionArgs.end(),
-                            extractOp.tensor()) !=
+                            extractOp.getTensor()) !=
                   loopNest.inputRegionArgs.end()) {
                 // TODO: worth looking into why this happens
                 continue;
               }
-              loopNest.inputRegionArgs.push_back(extractOp.tensor());
+              loopNest.inputRegionArgs.push_back(extractOp.getTensor());
               loopNest.inputMaps.push_back(AffineMap::get(
                   loopNest.inductionVars.size(),
                   /*symbolCount=*/0, resultExprs, op.getContext()));
               auto maybeInputOperand =
-                  traverseTiedLoopOperands(extractOp.tensor());
-              if (!maybeInputOperand.hasValue()) {
+                  traverseTiedLoopOperands(extractOp.getTensor());
+              if (!maybeInputOperand.has_value()) {
                 // errs() << "interrupt 4\n";
                 return WalkResult::interrupt();
               }
               loopNest.inputTensorOperands.push_back(
-                  maybeInputOperand.getValue().first);
+                  maybeInputOperand.value().first);
             }
           }
         }
@@ -246,7 +246,7 @@ Optional<LoopNest> parseLoopNest(scf::ForOp op) {
     return WalkResult::advance();
   });
   if (result.wasInterrupted()) {
-    return llvm::None;
+    return std::nullopt;
   }
   return loopNest;
 }
@@ -254,15 +254,15 @@ Optional<LoopNest> parseLoopNest(scf::ForOp op) {
 LoopNestAnalysis::LoopNestAnalysis(Operation *op) {
   op->walk([&](scf::ForOp forOp) {
     auto maybeNest = parseLoopNest(forOp);
-    if (maybeNest.hasValue()) {
-      forOpMapping[forOp] = maybeNest.getValue();
+    if (maybeNest.has_value()) {
+      forOpMapping[forOp] = maybeNest.value();
     }
   });
 }
 
-Optional<LoopNest> LoopNestAnalysis::getLoopNest(scf::ForOp op) const {
+std::optional<LoopNest> LoopNestAnalysis::getLoopNest(scf::ForOp op) const {
   if (forOpMapping.count(op) == 0) {
-    return llvm::None;
+    return std::nullopt;
   }
   return forOpMapping.lookup(op);
 }

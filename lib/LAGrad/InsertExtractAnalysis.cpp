@@ -1,7 +1,7 @@
 #include "LAGrad/Analysis.h"
 #include "LAGrad/Utils.h"
-#include "mlir/Dialect/Linalg/IR/LinalgOps.h"
-#include "mlir/Dialect/SCF/SCF.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Dominance.h"
 
@@ -10,14 +10,14 @@ InsertExtractAnalysis::InsertExtractAnalysis(Operation *op) {
   DominanceInfo dom;
   op->walk([&](tensor::ExtractSliceOp op) {
     auto maybeInsertSliceOp = getMatchingInsertSlice(op, dom);
-    if (maybeInsertSliceOp.hasValue()) {
-      extract_to_insert[op] = maybeInsertSliceOp.getValue();
-      matchingInserts.insert(maybeInsertSliceOp.getValue());
+    if (maybeInsertSliceOp.has_value()) {
+      extract_to_insert[op] = maybeInsertSliceOp.value();
+      matchingInserts.insert(maybeInsertSliceOp.value());
       for (auto &use : op.getResult().getUses()) {
         if (auto linalgOp = dyn_cast<linalg::LinalgOp>(use.getOwner())) {
           // Only handle the case where the linalg op has one output for now.
-          if (linalgOp.isOutputTensor(&use) && linalgOp.getNumOutputs() == 1 &&
-              linalgOp.hasTensorSemantics()) {
+          if (linalgOp.isInitTensor(&use) && linalgOp.getNumDpsInits() == 1 &&
+              linalgOp.hasPureTensorSemantics()) {
             linalgInPlaceOps.insert(linalgOp);
           }
         }
@@ -53,19 +53,19 @@ bool InsertExtractAnalysis::isLinalgMarkedForBufferization(
   return linalgInPlaceOps.count(op) > 0;
 }
 
-Optional<tensor::InsertSliceOp>
+std::optional<tensor::InsertSliceOp>
 InsertExtractAnalysis::getMatchingInsertSlice(tensor::ExtractSliceOp op,
                                               const DominanceInfo &dom) const {
   if (disabled)
-    return llvm::None;
+    return std::nullopt;
   // The source of the extract slice should have exactly one use besides the
   // insert slice op.
   size_t domUseCount = 0;
   tensor::InsertSliceOp insertSliceOp;
-  for (Operation *user : op.source().getUsers()) {
+  for (Operation *user : op.getSource().getUsers()) {
     if (dom.properlyDominates(op.getResult(), user)) {
       if (auto iso = dyn_cast<tensor::InsertSliceOp>(user)) {
-        if (iso.dest() == op.source()) {
+        if (iso.getDest() == op.getSource()) {
           insertSliceOp = iso;
         }
       }
@@ -73,7 +73,7 @@ InsertExtractAnalysis::getMatchingInsertSlice(tensor::ExtractSliceOp op,
     }
   }
   if (domUseCount != 1) {
-    return llvm::None;
+    return std::nullopt;
   }
 
   // We ultimately remove the insertSliceOp, so we must ensure that the
@@ -81,7 +81,7 @@ InsertExtractAnalysis::getMatchingInsertSlice(tensor::ExtractSliceOp op,
   bool isWrittenInPlace = false;
   for (OpOperand &use : op.getResult().getUses()) {
     if (auto linalgOp = dyn_cast<linalg::LinalgOp>(use.getOwner())) {
-      if (linalgOp.isOutputTensor(&use)) {
+      if (linalgOp.isInitTensor(&use)) {
         isWrittenInPlace = true;
       }
     } else if (auto forOp = dyn_cast<scf::ForOp>(use.getOwner())) {
@@ -97,7 +97,7 @@ InsertExtractAnalysis::getMatchingInsertSlice(tensor::ExtractSliceOp op,
     SmallVector<Value> frontier{op.getResult()};
     ValueSet derivedFromResult;
     runTopDownDFS(frontier, derivedFromResult);
-    linked = derivedFromResult.contains(insertSliceOp.source());
+    linked = derivedFromResult.contains(insertSliceOp.getSource());
   }
 
   if (linked && isWrittenInPlace && insertSliceOp &&
@@ -106,6 +106,6 @@ InsertExtractAnalysis::getMatchingInsertSlice(tensor::ExtractSliceOp op,
       (insertSliceOp.getMixedStrides() == op.getMixedStrides())) {
     return insertSliceOp;
   }
-  return llvm::None;
+  return std::nullopt;
 }
 } // namespace mlir

@@ -1,5 +1,7 @@
 #include "LAGrad/Passes.h"
-#include "mlir/Dialect/Linalg/IR/LinalgOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/Support/raw_ostream.h"
@@ -26,7 +28,7 @@ static MemRefType convertToFullyDynamicMemRef(MemRefType type) {
   shape.reserve(type.getRank());
   for (int64_t dim = 0; dim < type.getRank(); dim++)
     shape.push_back(-1);
-  return eraseStridedLayout(MemRefType::get(shape, type.getElementType()));
+  return MemRefType::get(shape, type.getElementType());
 }
 
 static SmallVector<Type, 4> extractOperandTypes(Operation *op) {
@@ -77,7 +79,7 @@ FlatSymbolRefAttr getOrInsertFuncDecl(linalg::LinalgOp linalgOp,
 
   auto fnType = rewriter.getFunctionType(extractOperandTypes(linalgOp), {});
   auto funcOp =
-      rewriter.create<FuncOp>(moduleOp.getLoc(), fnNameAttr.getValue(), fnType);
+      rewriter.create<func::FuncOp>(moduleOp.getLoc(), fnNameAttr.getValue(), fnType);
   funcOp->setAttr("llvm.emit_c_interface", UnitAttr::get(ctx));
   funcOp.setPrivate();
   return fnNameAttr;
@@ -90,8 +92,8 @@ public:
 
   LogicalResult matchAndRewrite(linalg::GenericOp genericOp,
                                 PatternRewriter &rewriter) const override {
-    if (genericOp.hasTensorSemantics() ||
-        !genericOp.library_call().hasValue()) {
+    if (genericOp.hasPureTensorSemantics() ||
+        !genericOp.getLibraryCall().has_value()) {
       // Meant to run after bufferization
       return failure();
     }
@@ -99,7 +101,7 @@ public:
     // if/when appropriate
     auto fnNameAttr = getOrInsertFuncDecl(
         genericOp, genericOp.getLibraryCallName(), rewriter);
-    rewriter.replaceOpWithNewOp<CallOp>(
+    rewriter.replaceOpWithNewOp<func::CallOp>(
         genericOp, fnNameAttr, TypeRange(),
         createTypeCanonicalizedMemRefOperands(rewriter, genericOp.getLoc(),
                                               genericOp.getOperands()));
@@ -108,10 +110,24 @@ public:
 };
 
 static unsigned int checkBitWidths(linalg::LinalgOp op) {
-  assert(op.getNumOutputs() > 0);
-  unsigned int bitWidth = op.getOutputBufferTypes()[0].getElementTypeBitWidth();
-  for (OpOperand *operand : op.getInputAndOutputOperands()) {
+  assert(op.getNumDpsInits() > 0);
+  unsigned int bitWidth = op.getDpsInits().getTypes()[0].cast<ShapedType>().getElementTypeBitWidth();
+  for (OpOperand *operand : op.getDpsInputOperands()) {
     Type type = operand->get().getType();
+    if (auto memrefType = type.dyn_cast<MemRefType>()) {
+      if (memrefType.getElementTypeBitWidth() != bitWidth) {
+        assert(false &&
+               "Expected all linalg MemRef operands to have the same bitwidth");
+      }
+    } else if (auto floatType = type.dyn_cast<FloatType>()) {
+      if (floatType.getIntOrFloatBitWidth() != bitWidth) {
+        assert(false &&
+               "Expected all linalg Float operands to have the same bitwidth");
+      }
+    }
+  }
+  for (int64_t i = 0, e = op.getNumDpsInits(); i < e; ++i) {
+    Type type = op.getDpsInitOperand(i)->get().getType();
     if (auto memrefType = type.dyn_cast<MemRefType>()) {
       if (memrefType.getElementTypeBitWidth() != bitWidth) {
         assert(false &&
@@ -132,7 +148,7 @@ public:
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(linalg::MatmulOp mmOp,
                                 PatternRewriter &rewriter) const override {
-    if (mmOp.hasTensorSemantics()) {
+    if (mmOp.hasPureTensorSemantics()) {
       return failure();
     }
 
@@ -141,7 +157,7 @@ public:
     fnName[0] = getFloatPrefix(bitWidth);
 
     FlatSymbolRefAttr fnNameAttr = getOrInsertFuncDecl(mmOp, fnName, rewriter);
-    rewriter.replaceOpWithNewOp<CallOp>(
+    rewriter.replaceOpWithNewOp<func::CallOp>(
         mmOp, fnNameAttr, TypeRange(),
         createTypeCanonicalizedMemRefOperands(rewriter, mmOp.getLoc(),
                                               mmOp.getOperands()));
@@ -155,7 +171,7 @@ public:
   LogicalResult matchAndRewrite(linalg::MatvecOp mvOp,
                                 PatternRewriter &rewriter) const override {
     // mvOp.getResult(0).getType().dyn_cast<MemRefType>().getElementTypeBitWidth
-    if (mvOp.hasTensorSemantics()) {
+    if (mvOp.hasPureTensorSemantics()) {
       return failure();
     }
 
@@ -164,7 +180,7 @@ public:
     fnName[0] = getFloatPrefix(bitWidth);
 
     FlatSymbolRefAttr fnNameAttr = getOrInsertFuncDecl(mvOp, fnName, rewriter);
-    rewriter.replaceOpWithNewOp<CallOp>(
+    rewriter.replaceOpWithNewOp<func::CallOp>(
         mvOp, fnNameAttr, TypeRange(),
         createTypeCanonicalizedMemRefOperands(rewriter, mvOp.getLoc(),
                                               mvOp.getOperands()));
@@ -177,7 +193,7 @@ public:
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(linalg::DotOp op,
                                 PatternRewriter &rewriter) const override {
-    if (op.hasTensorSemantics()) {
+    if (op.hasPureTensorSemantics()) {
       return failure();
     }
     unsigned int bitWidth = checkBitWidths(op);
@@ -186,7 +202,7 @@ public:
     std::string fnName = "ddot";
     fnName[0] = getFloatPrefix(bitWidth);
     FlatSymbolRefAttr fnNameAttr = getOrInsertFuncDecl(op, fnName, rewriter);
-    rewriter.replaceOpWithNewOp<CallOp>(
+    rewriter.replaceOpWithNewOp<func::CallOp>(
         op, fnNameAttr, TypeRange(),
         createTypeCanonicalizedMemRefOperands(rewriter, op.getLoc(),
                                               op.getOperands()));
@@ -214,7 +230,7 @@ struct LinalgKnownLibraryCallPass
     patterns.add<ReplaceMatmul>(patterns.getContext());
     patterns.add<ReplaceMatVec>(patterns.getContext());
     patterns.add<ReplaceDot>(patterns.getContext());
-    if (failed(applyPatternsAndFoldGreedily(getOperation()->getRegions(),
+    if (failed(applyPatternsAndFoldGreedily(getOperation(),
                                             std::move(patterns)))) {
       signalPassFailure();
     }

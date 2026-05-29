@@ -1,13 +1,14 @@
 #include "LAGrad/Logger.h"
 #include "LAGrad/Utils.h"
-#include "mlir/Dialect/Linalg/IR/LinalgOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
 using llvm::errs;
 namespace mlir {
-void analyzeDynamicShapes(LAGradContext &ctx, FuncOp funcOp,
+void analyzeDynamicShapes(LAGradContext &ctx, func::FuncOp funcOp,
                           OpBuilder &builder) {
   OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToStart(&funcOp.getBody().getBlocks().front());
@@ -33,7 +34,7 @@ void analyzeDynamicShapes(LAGradContext &ctx, FuncOp funcOp,
     }
   }
 
-  funcOp.walk([&](linalg::InitTensorOp op) {
+  funcOp.walk([&](tensor::EmptyOp op) {
     RankedTensorType type = op.getType();
     if (type.getNumDynamicDims() > 0) {
       SmallVector<OpFoldResult> shape;
@@ -42,7 +43,7 @@ void analyzeDynamicShapes(LAGradContext &ctx, FuncOp funcOp,
         if (type.isDynamicDim(idx)) {
           shape.push_back(op.getDynamicSize(idx));
         } else {
-          shape.push_back(intToAttr(op.getStaticSize(idx)));
+          shape.push_back(intToAttr(type.getDimSize(idx)));
         }
       }
       ctx.dynamic_shapes.insert(std::make_pair(op.getResult(), shape));
@@ -50,10 +51,11 @@ void analyzeDynamicShapes(LAGradContext &ctx, FuncOp funcOp,
   });
 
   funcOp.walk([&](linalg::LinalgOp op) {
-    if (isa<linalg::InitTensorOp>(op)) {
+    if (isa<tensor::EmptyOp>(op)) {
       return;
     }
-    for (OpOperand *operand : op.getOutputTensorOperands()) {
+    for (int64_t i = 0, e = op.getNumDpsInits(); i < e; ++i) {
+      OpOperand *operand = op.getDpsInitOperand(i);
       if (auto type = operand->get().getType().cast<RankedTensorType>()) {
         if (type.getNumDynamicDims() > 0) {
           assert(ctx.dynamic_shapes.count(operand->get()) &&

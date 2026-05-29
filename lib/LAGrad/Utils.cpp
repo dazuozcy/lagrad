@@ -1,11 +1,15 @@
 #include "LAGrad/Utils.h"
 #include "LAGrad/LAGradOps.h"
-#include "mlir/Analysis/AffineAnalysis.h"
-#include "mlir/Analysis/LoopAnalysis.h"
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
-#include "mlir/Dialect/Linalg/IR/LinalgOps.h"
-#include "mlir/Dialect/SCF/SCF.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -20,7 +24,7 @@ bool isFloatOrFloatTensor(Type typ) {
 
 // Specialization of getSupportedReduction for scf.for ops.
 static Value SCFGetSupportedReduction(scf::ForOp forOp, unsigned pos,
-                                      AtomicRMWKind &kind) {
+                                      arith::AtomicRMWKind &kind) {
   SmallVector<Operation *> combinerOps;
   Value reducedVal =
       matchReduction(forOp.getRegionIterArgs(), pos, combinerOps);
@@ -32,16 +36,16 @@ static Value SCFGetSupportedReduction(scf::ForOp forOp, unsigned pos,
     return nullptr;
 
   Operation *combinerOp = combinerOps.back();
-  Optional<AtomicRMWKind> maybeKind =
-      TypeSwitch<Operation *, Optional<AtomicRMWKind>>(combinerOp)
-          .Case([](arith::AddFOp) { return AtomicRMWKind::addf; })
-          // .Case([](arith::MulFOp) { return AtomicRMWKind::mulf; })
-          .Case([](arith::AddIOp) { return AtomicRMWKind::addi; })
-          // .Case([](arith::MulIOp) { return AtomicRMWKind::muli; })
-          .Default([](Operation *) -> Optional<AtomicRMWKind> {
+  std::optional<arith::AtomicRMWKind> maybeKind =
+      TypeSwitch<Operation *, std::optional<arith::AtomicRMWKind>>(combinerOp)
+          .Case([](arith::AddFOp) { return arith::AtomicRMWKind::addf; })
+          // .Case([](arith::MulFOp) { return arith::AtomicRMWKind::mulf; })
+          .Case([](arith::AddIOp) { return arith::AtomicRMWKind::addi; })
+          // .Case([](arith::MulIOp) { return arith::AtomicRMWKind::muli; })
+          .Default([](Operation *) -> std::optional<arith::AtomicRMWKind> {
             // TODO: AtomicRMW supports other kinds of reductions this is
             // currently not detecting, add those when the need arises.
-            return llvm::None;
+            return std::nullopt;
           });
   if (!maybeKind)
     return nullptr;
@@ -51,22 +55,22 @@ static Value SCFGetSupportedReduction(scf::ForOp forOp, unsigned pos,
 }
 
 void SCFGetSupportedReductions(
-    scf::ForOp forOp, SmallVectorImpl<LoopReduction> &supportedReductions) {
-  unsigned numIterArgs = forOp.getNumIterOperands();
+    scf::ForOp forOp, SmallVectorImpl<affine::LoopReduction> &supportedReductions) {
+  unsigned numIterArgs = forOp.getNumRegionIterArgs();
   if (numIterArgs == 0)
     return;
   supportedReductions.reserve(numIterArgs);
   for (unsigned i = 0; i < numIterArgs; ++i) {
-    AtomicRMWKind kind;
+    arith::AtomicRMWKind kind;
     if (Value value = SCFGetSupportedReduction(forOp, i, kind))
-      supportedReductions.emplace_back(LoopReduction{kind, i, value});
+      supportedReductions.emplace_back(affine::LoopReduction{kind, i, value});
   }
 }
 
 bool isLoopParallel(scf::ForOp forOp) {
-  SmallVector<LoopReduction> parallelReductions;
+  SmallVector<affine::LoopReduction> parallelReductions;
   SCFGetSupportedReductions(forOp, parallelReductions);
-  return forOp.getNumIterOperands() == parallelReductions.size();
+  return forOp.getNumRegionIterArgs() == parallelReductions.size();
 }
 
 bool isIntOrIntTensor(Type typ) {
@@ -147,17 +151,17 @@ cloneBasicBlock(llvm::iterator_range<Region::OpIterator> bbOps,
   return newRegionOps;
 }
 
-FuncOp copyFunctionDeclaration(FuncOp funcOp, llvm::StringRef funcName,
+func::FuncOp copyFunctionDeclaration(func::FuncOp funcOp, llvm::StringRef funcName,
                                OpBuilder &rewriter) {
   PatternRewriter::InsertionGuard insertGuard(rewriter);
   rewriter.setInsertionPointAfter(funcOp);
-  auto newOp = cast<FuncOp>(rewriter.clone(*funcOp));
+  auto newOp = cast<func::FuncOp>(rewriter.clone(*funcOp));
 
   newOp.setName(funcName);
   return newOp;
 }
 
-FuncOp differentiateFunction(FuncOp funcOp, LAGradContext &ctx,
+func::FuncOp differentiateFunction(func::FuncOp funcOp, LAGradContext &ctx,
                              ArrayAttr gradientsOf,
                              ConversionPatternRewriter &rewriter,
                              bool topLevel = false, bool oneHotSparse = false) {
@@ -168,17 +172,17 @@ FuncOp differentiateFunction(FuncOp funcOp, LAGradContext &ctx,
   }
 
   // Need to double check the return type.
-  assert(funcOp.getType().getNumResults() == 1 &&
+  assert(funcOp.getFunctionType().getNumResults() == 1 &&
          "differentiating functions with more than one result not supported");
   if (!topLevel) {
-    Type gradSignalType = funcOp.getType().getResult(0);
+    Type gradSignalType = funcOp.getFunctionType().getResult(0);
     if (oneHotSparse && gradSignalType.isa<RankedTensorType>()) {
       auto tensorType = gradSignalType.cast<RankedTensorType>();
       gradSignalType = RankedTensorType::get(
           tensorType.getShape(), tensorType.getElementType(),
           StringAttr::get(rewriter.getContext(), "onehot"));
     }
-    funcOp.insertArgument(funcOp.getNumArguments(), gradSignalType, {});
+    funcOp.insertArgument(funcOp.getNumArguments(), gradSignalType, DictionaryAttr(), funcOp.getLoc());
   }
 
   std::vector<Operation *> ops;
@@ -191,7 +195,7 @@ FuncOp differentiateFunction(FuncOp funcOp, LAGradContext &ctx,
   PatternRewriter::InsertionGuard insertGuard(rewriter);
   for (auto it = ops.rbegin(); it != ops.rend(); it++) {
     Operation *op = *it;
-    if (isa<ReturnOp>(op)) {
+    if (isa<func::ReturnOp>(op)) {
       // This is the exit point
       rewriter.setInsertionPoint(op);
       assert(op->getNumOperands() == 1 &&
@@ -212,9 +216,9 @@ FuncOp differentiateFunction(FuncOp funcOp, LAGradContext &ctx,
     }
   }
 
-  auto fntyp = funcOp.getType();
-  SmallVector<Type> returnType(funcOp.getType().getNumInputs());
-  SmallVector<Value> returnValue(funcOp.getType().getNumInputs());
+  auto fntyp = funcOp.getFunctionType();
+  SmallVector<Type> returnType(funcOp.getFunctionType().getNumInputs());
+  SmallVector<Value> returnValue(funcOp.getFunctionType().getNumInputs());
   if (gradientsOf) {
     returnType.resize(gradientsOf.size());
     returnValue.resize(gradientsOf.size());
@@ -243,7 +247,7 @@ FuncOp differentiateFunction(FuncOp funcOp, LAGradContext &ctx,
   }
   funcOp.setType(
       FunctionType::get(funcOp.getContext(), fntyp.getInputs(), returnType));
-  rewriter.create<mlir::ReturnOp>(region->getLoc(), returnValue);
+  rewriter.create<mlir::func::ReturnOp>(region->getLoc(), returnValue);
   return funcOp;
 }
 
@@ -265,14 +269,14 @@ Value onesLike(LAGradContext &ctx, Location loc, Value operand,
       if (shapedType.getNumDynamicDims() > 0) {
         assert(ctx.dynamic_shapes.count(operand) &&
                "onesLike: operand was not found in dynamic shape map");
-        space = builder.create<linalg::InitTensorOp>(
+        space = builder.create<tensor::EmptyOp>(
             loc, ctx.dynamic_shapes.lookup(operand),
             shapedType.getElementType());
       } else {
-        space = builder.create<linalg::InitTensorOp>(
+        space = builder.create<tensor::EmptyOp>(
             loc, shapedType.getShape(), shapedType.getElementType());
       }
-      auto filled = builder.create<linalg::FillOp>(loc, one, space);
+      auto filled = builder.create<linalg::FillOp>(loc, ValueRange{one}, ValueRange{space});
       return filled.getResult(0);
     }
     assert(shapedType.getNumDynamicDims() == 0 &&
@@ -311,13 +315,13 @@ Value getZero(Location loc, Value operand, OpBuilder &rewriter, bool init) {
         }
       }
       // init_tensor ops don't support encodings out of the box.
-      Value space = rewriter.create<linalg::InitTensorOp>(
+      Value space = rewriter.create<tensor::EmptyOp>(
           loc, shape, shapedType.getElementType());
       if (shapedType.getEncoding()) {
         space = rewriter.create<lagrad::PackOp>(loc, shapedType, space);
         // space = rewriter.create<tensor::CastOp>(loc, shapedType, space);
       }
-      auto filled = rewriter.create<linalg::FillOp>(loc, zero, space);
+      auto filled = rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{space});
       return filled.getResult(0);
     } else {
       // Will automatically be broadcasted to the right shape.
@@ -389,11 +393,11 @@ void collectFreeVars(Block *parentBlock, Region &region, ValueSet &out) {
 // This is definitely a bandaid behind an explosion of complexity in the
 // autodiff method.
 void eraseUnusedCalls(ModuleOp moduleOp, PatternRewriter &rewriter) {
-  moduleOp.walk([&](CallOp callOp) {
-    if (callOp.calleeAttr().getValue().startswith("__grad") &&
+  moduleOp.walk([&](func::CallOp callOp) {
+    if (callOp.getCalleeAttr().getValue().starts_with("__grad") &&
         callOp.use_empty()) {
       // rewriter.eraseOp(callOp);
-      // llvm::outs() << "saw callOp " << callOp.calleeAttr().getValue()
+      // llvm::outs() << "saw callOp " << callOp.getCalleeAttr().value()
       //              << " with " << callOp.use_empty() << " uses\n";
     }
   });
@@ -413,9 +417,9 @@ Value reverseBatchMatmul(linalg::BatchMatmulOp op, Value operand,
                     : SmallVector<AffineMap, 6>{idMap.getSubMap({0, 2, 1}),
                                                 idMap.getSubMap({0, 2, 3}),
                                                 idMap.getSubMap({0, 1, 3})};
-  SmallVector<StringRef, 6> iteratorTypes(
-      {getParallelIteratorTypeName(), getParallelIteratorTypeName(),
-       getReductionIteratorTypeName(), getParallelIteratorTypeName()});
+  SmallVector<utils::IteratorType, 6> iteratorTypes(
+      {utils::IteratorType::parallel, utils::IteratorType::parallel,
+       utils::IteratorType::reduction, utils::IteratorType::parallel});
   auto inputs = op_index == 0
                     ? SmallVector<Value, 2>{vjp_value, op.getOperand(1)}
                     : SmallVector<Value, 2>{op.getOperand(0), vjp_value};
@@ -443,7 +447,7 @@ Value addInPlace(Value source, Value dest, OpBuilder &builder) {
   auto rank = outputShape.getRank();
   SmallVector<AffineMap, 2> indexingMaps(2,
                                          builder.getMultiDimIdentityMap(rank));
-  SmallVector<StringRef, 1> iteratorTypes(rank, getParallelIteratorTypeName());
+  SmallVector<utils::IteratorType, 1> iteratorTypes(rank, utils::IteratorType::parallel);
   auto addOp = builder.create<linalg::GenericOp>(
       dest.getLoc(),
       /*resultTensorType=*/outputShape,
@@ -492,8 +496,8 @@ void populateVJP(Operation *op, LAGradContext &ctx,
 
     // Collect the free variables in the then block of the if op
     llvm::SmallDenseSet<Value> freeOperands;
-    collectFreeVars(ifOp.thenBlock(), ifOp.thenRegion(), freeOperands);
-    collectFreeVars(ifOp.elseBlock(), ifOp.elseRegion(), freeOperands);
+    collectFreeVars(ifOp.thenBlock(), ifOp.getThenRegion(), freeOperands);
+    collectFreeVars(ifOp.elseBlock(), ifOp.getElseRegion(), freeOperands);
 
     for (auto freeOperand : freeOperands) {
       auto result =
@@ -520,10 +524,10 @@ void populateVJP(Operation *op, LAGradContext &ctx,
 
     Value result = forOp.getResult(result_idx);
     auto vjp_value = env[result];
-    env[forOp.getIterOperands()[result_idx]] = env[result];
+    env[forOp.getInitArgs()[result_idx]] = env[result];
     assert(vjp_value && "vjp value for scf.for op was not found");
     ValueSet freeOperands;
-    collectFreeVars(forOp.getBody(), forOp.getLoopBody(), freeOperands);
+    collectFreeVars(forOp.getBody(), forOp.getRegion(), freeOperands);
 
     SmallVector<Value> free_operand_vec;
     for (auto v : freeOperands) {
@@ -581,17 +585,17 @@ void populateVJP(Operation *op, LAGradContext &ctx,
       }
     } else if (isa<arith::NegFOp>(op)) {
       vjp_value = rewriter.create<arith::NegFOp>(op->getLoc(), vjp_value);
-    } else if (auto selectOp = dyn_cast<mlir::SelectOp>(op)) {
+    } else if (auto selectOp = dyn_cast<mlir::arith::SelectOp>(op)) {
       if (op_index == 1) {
         // true branch
         auto zero = getZero(op->getLoc(), operand, rewriter);
-        vjp_value = rewriter.create<SelectOp>(
-            op->getLoc(), selectOp.condition(), vjp_value, zero);
+        vjp_value = rewriter.create<arith::SelectOp>(
+            op->getLoc(), selectOp.getCondition(), vjp_value, zero);
       } else if (op_index == 2) {
         // false branch
         auto zero = getZero(op->getLoc(), operand, rewriter);
-        vjp_value = rewriter.create<SelectOp>(
-            op->getLoc(), selectOp.condition(), zero, vjp_value);
+        vjp_value = rewriter.create<arith::SelectOp>(
+            op->getLoc(), selectOp.getCondition(), zero, vjp_value);
       }
     } else if (auto expOp = dyn_cast<math::ExpOp>(op)) {
       vjp_value = rewriter.create<arith::MulFOp>(expOp.getLoc(), vjp_value,
@@ -634,11 +638,11 @@ void populateVJP(Operation *op, LAGradContext &ctx,
       auto loc = op->getLoc();
       auto one = onesLike(ctx, loc, operand, rewriter);
       vjp_value = rewriter.create<arith::MulFOp>(
-          loc, powFOp.rhs(),
+          loc, powFOp.getRhs(),
           rewriter.create<math::PowFOp>(
-              loc, powFOp.lhs(),
-              rewriter.create<arith::SubFOp>(loc, powFOp.rhs(), one)));
-    } else if (auto callOp = dyn_cast<CallOp>(op)) {
+              loc, powFOp.getLhs(),
+              rewriter.create<arith::SubFOp>(loc, powFOp.getRhs(), one)));
+    } else if (auto callOp = dyn_cast<func::CallOp>(op)) {
       if (!isFloatOrFloatTensor(operand.getType())) {
         continue;
       }
@@ -654,27 +658,27 @@ void populateVJP(Operation *op, LAGradContext &ctx,
       Value new_val = vjp_value;
       if (requires_add) {
         auto before = rewriter.create<tensor::ExtractOp>(op->getLoc(), space,
-                                                         extractOp.indices());
+                                                         extractOp.getIndices());
         new_val =
             rewriter.create<arith::AddFOp>(op->getLoc(), before, vjp_value);
       }
       env[operand] = rewriter.create<tensor::InsertOp>(
-          op->getLoc(), new_val, space, extractOp.indices());
+          op->getLoc(), new_val, space, extractOp.getIndices());
       continue;
     } else if (auto insertOp = dyn_cast<tensor::InsertOp>(op)) {
       if (op_index > 0) {
         continue;
       }
       vjp_value = rewriter.create<tensor::ExtractOp>(op->getLoc(), vjp_value,
-                                                     insertOp.indices());
+                                                     insertOp.getIndices());
 
       // The destination is effectively the same memory location as the result.
-      auto zero = getZero(insertOp.getLoc(), insertOp.scalar(), rewriter);
+      auto zero = getZero(insertOp.getLoc(), insertOp.getScalar(), rewriter);
       auto new_dresult = rewriter.create<tensor::InsertOp>(
-          insertOp.getLoc(), zero, env[insertOp.result()], insertOp.indices());
-      env[insertOp.dest()] = new_dresult;
-      env[insertOp.result()] = new_dresult;
-      // env[insertOp.dest()] = env[insertOp.result()];
+          insertOp.getLoc(), zero, env[insertOp.getResult()], insertOp.getIndices());
+      env[insertOp.getDest()] = new_dresult;
+      env[insertOp.getResult()] = new_dresult;
+      // env[insertOp.getDest()] = env[insertOp.getResult()];
     } else if (auto extractSliceOp = dyn_cast<tensor::ExtractSliceOp>(op)) {
       auto resultType =
           extractSliceOp.getResult().getType().cast<RankedTensorType>();
@@ -694,9 +698,9 @@ void populateVJP(Operation *op, LAGradContext &ctx,
       }
       env[operand] = rewriter.create<tensor::InsertSliceOp>(
           operand.getLoc(), operand.getType(), new_value, space,
-          extractSliceOp.offsets(), extractSliceOp.sizes(),
-          extractSliceOp.strides(), extractSliceOp.static_offsets(),
-          extractSliceOp.static_sizes(), extractSliceOp.static_strides());
+          extractSliceOp.getOffsets(), extractSliceOp.getSizes(),
+          extractSliceOp.getStrides(), extractSliceOp.getStaticOffsets(),
+          extractSliceOp.getStaticSizes(), extractSliceOp.getStaticStrides());
       continue;
     } else if (auto insertSliceOp = dyn_cast<tensor::InsertSliceOp>(op)) {
       if (op_index > 0) {
@@ -706,16 +710,16 @@ void populateVJP(Operation *op, LAGradContext &ctx,
           op->getLoc(), insertSliceOp.getSourceType(), vjp_value,
           insertSliceOp.getMixedOffsets(), insertSliceOp.getMixedSizes(),
           insertSliceOp.getMixedStrides());
-      auto zero = getZero(op->getLoc(), insertSliceOp.source(), rewriter);
+      auto zero = getZero(op->getLoc(), insertSliceOp.getSource(), rewriter);
       auto destGrad = rewriter.create<tensor::InsertSliceOp>(
           op->getLoc(), zero, env[insertSliceOp.getResult()],
           insertSliceOp.getMixedOffsets(), insertSliceOp.getMixedSizes(),
           insertSliceOp.getMixedStrides());
-      env[insertSliceOp.dest()] = destGrad;
+      env[insertSliceOp.getDest()] = destGrad;
 
-      // env[insertSliceOp.dest()] = env[insertSliceOp.getResult()];
+      // env[insertSliceOp.getDest()] = env[insertSliceOp.getResult()];
     } else if (auto genericOp = dyn_cast<linalg::GenericOp>(op)) {
-      if (op_index > static_cast<size_t>(genericOp.getNumInputs() - 1))
+      if (op_index > static_cast<size_t>(genericOp.getNumDpsInputs() - 1))
         continue;
 
       // Additionally compute adjoints for all free variables. We only want
@@ -723,8 +727,8 @@ void populateVJP(Operation *op, LAGradContext &ctx,
       if (op_index == 0) {
         // Also update the output gradients
         for (auto it :
-             llvm::zip(genericOp.getOutputOperands(), genericOp.getResults())) {
-          env[std::get<0>(it)->get()] = env[std::get<1>(it)];
+             llvm::zip(genericOp.getDpsInits(), genericOp.getResults())) {
+          env[std::get<0>(it)] = env[std::get<1>(it)];
         }
         llvm::SmallDenseSet<Value> freeOperands;
         collectFreeVars(genericOp.getBody(), genericOp.getBodyRegion(),
@@ -783,7 +787,7 @@ void populateVJP(Operation *op, LAGradContext &ctx,
           ValueRange({vjp_value, op->getOperand(1 - op_index)}),
           /*outputs=*/ValueRange({output}), indexing_maps,
           /*iteratorTypes=*/
-          SmallVector<StringRef>({getParallelIteratorTypeName()}),
+          SmallVector<utils::IteratorType>({utils::IteratorType::parallel}),
           /*doc=*/"Copy and scalar multiplication",
           /*library call=*/library_call,
           [&](OpBuilder &builder, Location loc, ValueRange regionArgs) {
@@ -797,7 +801,7 @@ void populateVJP(Operation *op, LAGradContext &ctx,
         continue;
       if (op_index == 0) {
         // TODO: This is probably a bandaid solution.
-        env[matvecOp.getOutputOperand(0)->get()] = env[matvecOp.getResult(0)];
+        env[matvecOp.getDpsInitOperand(0)->get()] = env[matvecOp.getResult(0)];
         // Broadcast the gradient signal
         assert(operand.getType().isa<RankedTensorType>() &&
                "matvec input was not a ranked tensor type");
@@ -806,8 +810,8 @@ void populateVJP(Operation *op, LAGradContext &ctx,
         indexingMaps[0] = indexingMaps[0].getSubMap({0});
         indexingMaps[1] = indexingMaps[1].getSubMap({1});
         auto opType = operand.getType().dyn_cast<RankedTensorType>();
-        SmallVector<StringRef, 6> iteratorTypes(opType.getRank(),
-                                                getParallelIteratorTypeName());
+        SmallVector<utils::IteratorType, 6> iteratorTypes(opType.getRank(),
+                                                utils::IteratorType::parallel);
         auto outerProductOp = rewriter.create<linalg::GenericOp>(
             operand.getLoc(),
             /*resultTensorTypes=*/opType,
@@ -834,8 +838,8 @@ void populateVJP(Operation *op, LAGradContext &ctx,
             op->getNumOperands(), rewriter.getMultiDimIdentityMap(2));
         indexingMaps[0] = indexingMaps[0].getSubMap({0});
         indexingMaps[2] = indexingMaps[2].getSubMap({1});
-        SmallVector<StringRef, 6> iteratorTypes(
-            {getReductionIteratorTypeName(), getParallelIteratorTypeName()});
+        SmallVector<utils::IteratorType, 6> iteratorTypes(
+            {utils::IteratorType::reduction, utils::IteratorType::parallel});
 
         // TODO: This currently uses the allocated gradient space and adds
         // it inside the matmul. This may produce incorrect results due to
@@ -869,8 +873,8 @@ void populateVJP(Operation *op, LAGradContext &ctx,
             op->getNumOperands(), rewriter.getMultiDimIdentityMap(2));
         indexingMaps[1] = indexingMaps[1].getSubMap({1});
         indexingMaps[2] = indexingMaps[2].getSubMap({0});
-        SmallVector<StringRef, 6> iteratorTypes(
-            {getParallelIteratorTypeName(), getReductionIteratorTypeName()});
+        SmallVector<utils::IteratorType, 6> iteratorTypes(
+            {utils::IteratorType::parallel, utils::IteratorType::reduction});
         auto matmulOp = rewriter.create<linalg::GenericOp>(
             operand.getLoc(),
             /*resultTensorTypes=*/operand.getType(),
@@ -897,8 +901,8 @@ void populateVJP(Operation *op, LAGradContext &ctx,
         indexingMaps[0] = indexingMaps[0].getSubMap({1});
         indexingMaps[1] = indexingMaps[1].getSubMap({0});
         auto opType = operand.getType().dyn_cast<RankedTensorType>();
-        SmallVector<StringRef, 6> iteratorTypes(opType.getRank(),
-                                                getParallelIteratorTypeName());
+        SmallVector<utils::IteratorType, 6> iteratorTypes(opType.getRank(),
+                                                utils::IteratorType::parallel);
         auto outerProductOp = rewriter.create<linalg::GenericOp>(
             operand.getLoc(),
             /*resultTensorTypes=*/opType,
@@ -929,9 +933,9 @@ void populateVJP(Operation *op, LAGradContext &ctx,
         indexingMaps[1] = indexingMaps[1].getSubMap({1, 2});
         indexingMaps[2] = indexingMaps[2].getSubMap({0, 2});
       }
-      SmallVector<StringRef, 6> iteratorTypes({getParallelIteratorTypeName(),
-                                               getReductionIteratorTypeName(),
-                                               getParallelIteratorTypeName()});
+      SmallVector<utils::IteratorType, 6> iteratorTypes({utils::IteratorType::parallel,
+                                               utils::IteratorType::reduction,
+                                               utils::IteratorType::parallel});
       SmallVector<Value> inputs(2);
       if (op_index == 0) {
         inputs[0] = vjp_value;
@@ -974,18 +978,18 @@ void populateVJP(Operation *op, LAGradContext &ctx,
   }
 }
 
-Value reverseCallOp(CallOp op, LAGradContext &ctx, Value vjp_value,
+Value reverseCallOp(func::CallOp op, LAGradContext &ctx, Value vjp_value,
                     size_t op_index, ConversionPatternRewriter &rewriter) {
   auto *context = op.getContext();
   std::stringstream gradFuncStream;
-  gradFuncStream << "__grad_" << op.callee().str() << "_arg" << op_index;
+  gradFuncStream << "__grad_" << op.getCallee().str() << "_arg" << op_index;
   auto gradFuncName = gradFuncStream.str();
   assert(ctx.moduleOp && "moduleOp was null");
   auto dFuncOp =
-      dyn_cast_or_null<FuncOp>(ctx.moduleOp.lookupSymbol(gradFuncName));
+      dyn_cast_or_null<func::FuncOp>(ctx.moduleOp.lookupSymbol(gradFuncName));
   if (!dFuncOp) {
     auto primalFunc =
-        dyn_cast<FuncOp>(ctx.moduleOp.lookupSymbol(op.calleeAttr()));
+        dyn_cast<func::FuncOp>(ctx.moduleOp.lookupSymbol(op.getCalleeAttr()));
     dFuncOp = copyFunctionDeclaration(primalFunc, gradFuncName, rewriter);
 
     auto innerGradsOf = ArrayAttr::get(
@@ -997,7 +1001,7 @@ Value reverseCallOp(CallOp op, LAGradContext &ctx, Value vjp_value,
   llvm::SmallVector<Value> operands(op.getOperands());
   operands.push_back(vjp_value);
   auto adjointCall =
-      rewriter.create<mlir::CallOp>(op.getLoc(), dFuncOp, operands);
+      rewriter.create<mlir::func::CallOp>(op.getLoc(), dFuncOp, operands);
   assert(adjointCall.getNumResults() == 1 &&
          "expected adjoint call to produce 1 result");
   return adjointCall.getResult(0);

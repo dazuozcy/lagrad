@@ -9,21 +9,16 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
-#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
-#include "llvm/Pass.h"
-#include "llvm/Support/CommandLine.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
 
 using namespace llvm;
 
 namespace {
-struct LLFastMathPass : public FunctionPass {
-  static char ID;
-  LLFastMathPass() : FunctionPass(ID) {}
-
-  virtual bool runOnFunction(Function &F) {
+struct LLFastMathPass : PassInfoMixin<LLFastMathPass> {
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
     bool modified = false;
     for (inst_iterator I = inst_begin(F), E = inst_end(F); I != E; ++I) {
       if (isa<FPMathOperator>(*I)) {
@@ -31,17 +26,21 @@ struct LLFastMathPass : public FunctionPass {
         modified = true;
       }
     }
-    return modified;
+    return modified ? PreservedAnalyses::none() : PreservedAnalyses::all();
   }
 };
 } // namespace
 
-char LLFastMathPass::ID = 0;
-
-static RegisterPass<LLFastMathPass> LX("llfast-math", "");
-
-static RegisterStandardPasses LY(PassManagerBuilder::EP_EarlyAsPossible,
-                                 [](const PassManagerBuilder &Builder,
-                                    legacy::PassManagerBase &PM) {
-                                   PM.add(new LLFastMathPass());
-                                 });
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
+llvmGetPassPluginInfo() {
+  return {LLVM_PLUGIN_API_VERSION, "LLFastMath", LLVM_VERSION_STRING,
+          [](PassBuilder &PB) {
+            PB.registerOptimizerEarlyEPCallback(
+                [](ModulePassManager &MPM, OptimizationLevel,
+                   ThinOrFullLTOPhase) {
+                  FunctionPassManager FPM;
+                  FPM.addPass(LLFastMathPass());
+                  MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+                });
+          }};
+}

@@ -13,7 +13,7 @@ include "LAGradDialect.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
-def LAGrad_DiffOp : LAGrad_Op<"diff", [NoSideEffect]> {
+def LAGrad_DiffOp : LAGrad_Op<"diff", [Pure]> {
     let summary = "Annotate a function for automatic differentiation via Enzyme";
     let description = [{
         The `lagrad.diff` operation annotates a function for automatic differentiation via Enzyme.
@@ -28,7 +28,7 @@ def LAGrad_DiffOp : LAGrad_Op<"diff", [NoSideEffect]> {
 }
 
 def LAGrad_GradOp : LAGrad_Op<"grad", [
-        NoSideEffect,
+        Pure,
         DeclareOpInterfaceMethods<SymbolUserOpInterface>
     ]> {
     let summary = "Reverse-mode autodiff a standard function.";
@@ -45,7 +45,7 @@ def LAGrad_GradOp : LAGrad_Op<"grad", [
 }
 
 def LAGrad_TangentOp : LAGrad_Op<"tangent", [
-        NoSideEffect,
+        Pure,
         DeclareOpInterfaceMethods<SymbolUserOpInterface>
     ]> {
     let summary = "Forward-mode autodiff a standard function.";
@@ -61,7 +61,7 @@ def LAGrad_TangentOp : LAGrad_Op<"tangent", [
     }];
 }
 
-def LAGrad_PackOp : LAGrad_Op<"pack", [NoSideEffect]> {
+def LAGrad_PackOp : LAGrad_Op<"pack", [Pure]> {
     let summary = "convert fully materialized triangular tensor to packed";
     let description = [{
         The `lagrad.pack` operation denotes a conversion from a fully materialized strictly lower triangular tensor to a packed triangular tensor.
@@ -74,7 +74,7 @@ def LAGrad_PackOp : LAGrad_Op<"pack", [NoSideEffect]> {
         $source attr-dict `:` type($source) `to` type($dest)
     }];
 
-    let verifier = [{ return ::verify(*this); }];
+    let hasVerifier = 1;
 }
 
 #endif // LAGRAD_OPS
