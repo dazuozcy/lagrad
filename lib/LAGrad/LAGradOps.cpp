@@ -75,7 +75,11 @@ LogicalResult GradOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
     gradientsOf.push_back(0);
   }
 
-  if (gradientsOf.size() != getNumResults())
+  // The op returns gradients for each argument in 'of'.
+  // When topLevel (no customGradSignal) and return_primal is set, it also returns the primal result.
+  bool returnPrimal = (*this)->hasAttrOfType<UnitAttr>("return_primal");
+  size_t expectedResults = gradientsOf.size() + ((customGradSignal || !returnPrimal) ? 0 : 1);
+  if (expectedResults != getNumResults())
     return emitOpError("incorrect number of results");
 
   for (unsigned i = 0; i < gradientsOf.size(); ++i) {
@@ -84,6 +88,19 @@ LogicalResult GradOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
       diag.attachNote() << "   op result types: " << getResult(i).getType();
       diag.attachNote() << "function arg types: "
                         << fnType.getInput(gradientsOf[i]);
+      return diag;
+    }
+  }
+
+  // Verify the last result is the primal result (function's return type)
+  // Only when topLevel (no customGradSignal) and return_primal is set
+  if (!customGradSignal && returnPrimal) {
+    if (fnType.getNumResults() != 1)
+      return emitOpError("differentiated function must have exactly 1 result");
+    if (getResult(gradientsOf.size()).getType() != fnType.getResult(0)) {
+      auto diag = emitOpError("primal result type mismatch");
+      diag.attachNote() << "   op result type: " << getResult(gradientsOf.size()).getType();
+      diag.attachNote() << "function result type: " << fnType.getResult(0);
       return diag;
     }
   }

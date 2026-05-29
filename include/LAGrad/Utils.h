@@ -72,7 +72,7 @@ func::FuncOp copyFunctionDeclaration(func::FuncOp funcOp, llvm::StringRef funcNa
 func::FuncOp differentiateFunction(func::FuncOp funcOp, LAGradContext &ctx,
                              ArrayAttr gradientsOf,
                              ConversionPatternRewriter &rewriter, bool topLevel,
-                             bool onehotSparse);
+                             bool onehotSparse, bool returnPrimal = false);
 
 Value reverseGenericOp(linalg::GenericOp op, LAGradContext &ctx, Value operand,
                        Value vjp_value, int op_index, Value output,

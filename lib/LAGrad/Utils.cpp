@@ -164,7 +164,8 @@ func::FuncOp copyFunctionDeclaration(func::FuncOp funcOp, llvm::StringRef funcNa
 func::FuncOp differentiateFunction(func::FuncOp funcOp, LAGradContext &ctx,
                              ArrayAttr gradientsOf,
                              ConversionPatternRewriter &rewriter,
-                             bool topLevel = false, bool oneHotSparse = false) {
+                             bool topLevel, bool oneHotSparse,
+                             bool returnPrimal) {
   Region *region = funcOp.getCallableRegion();
   if (!region) {
     funcOp->emitError("Function region cannot be null");
@@ -190,8 +191,9 @@ func::FuncOp differentiateFunction(func::FuncOp funcOp, LAGradContext &ctx,
     ops.push_back(&op);
   }
 
-  // env maps values to their gradient signals. x -> x_bar
+   // env maps values to their gradient signals. x -> x_bar
   llvm::DenseMap<Value, Value> env;
+  Value primalResult;
   PatternRewriter::InsertionGuard insertGuard(rewriter);
   for (auto it = ops.rbegin(); it != ops.rend(); it++) {
     Operation *op = *it;
@@ -201,6 +203,7 @@ func::FuncOp differentiateFunction(func::FuncOp funcOp, LAGradContext &ctx,
       assert(op->getNumOperands() == 1 &&
              "Expected function to return 1 value");
       Value operand = op->getOperand(0);
+      primalResult = operand;
       // Initialize the gradient signal to 1.0
       if (topLevel) {
         env[operand] =
@@ -244,6 +247,12 @@ func::FuncOp differentiateFunction(func::FuncOp funcOp, LAGradContext &ctx,
       return nullptr;
     }
     returnValue[0] = env[region->getArgument(0)];
+  }
+  // Append the primal result (e.g., loss) to the return values only for top-level grad ops
+  // when returnPrimal is explicitly requested
+  if (topLevel && returnPrimal && primalResult) {
+    returnType.push_back(primalResult.getType());
+    returnValue.push_back(primalResult);
   }
   funcOp.setType(
       FunctionType::get(funcOp.getContext(), fntyp.getInputs(), returnType));
@@ -996,7 +1005,10 @@ Value reverseCallOp(func::CallOp op, LAGradContext &ctx, Value vjp_value,
         context, {IntegerAttr::get(IntegerType::get(context, 64), op_index)});
     runActivityAnalysis(ctx, dFuncOp, innerGradsOf);
     populatePrimalCaches(ctx, dFuncOp, rewriter);
-    dFuncOp = differentiateFunction(dFuncOp, ctx, innerGradsOf, rewriter);
+    dFuncOp = differentiateFunction(dFuncOp, ctx, innerGradsOf, rewriter,
+                                    /*topLevel=*/false,
+                                    /*oneHotSparse=*/false,
+                                    /*returnPrimal=*/false);
   }
   llvm::SmallVector<Value> operands(op.getOperands());
   operands.push_back(vjp_value);
