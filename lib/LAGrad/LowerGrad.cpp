@@ -52,6 +52,7 @@ private:
     auto gradientsOf = gradOp->getAttr("of").dyn_cast_or_null<ArrayAttr>();
     bool customGradSignal = gradOp->hasAttrOfType<UnitAttr>("grad_signal");
     bool oneHotSparse = gradOp->hasAttrOfType<UnitAttr>("sparse");
+    bool returnPrimal = gradOp->hasAttrOfType<UnitAttr>("return_primal");
 
     // If we received request for a custom gradient signal, this is equivalent
     // to taking in the gradient signal as a parameter.
@@ -64,7 +65,8 @@ private:
     populatePrimalCaches(lagradctx, funcOp, rewriter);
     return differentiateFunction(funcOp, lagradctx, gradientsOf, rewriter,
                                  /*topLevel=*/!customGradSignal,
-                                 /*onehotsparse=*/oneHotSparse);
+                                 /*onehotsparse=*/oneHotSparse,
+                                 /*returnPrimal=*/returnPrimal);
   }
 };
 } // end anonymous namespace

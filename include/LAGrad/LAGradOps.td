@@ -34,6 +34,12 @@ def LAGrad_GradOp : LAGrad_Op<"grad", [
     let summary = "Reverse-mode autodiff a standard function.";
     let description = [{
         The `lagrad.grad` operation performs a source transformation to compute the gradient of a func op.
+        
+        Optional attributes:
+        - `of`: ArrayAttr of integers specifying which arguments to differentiate with respect to
+        - `grad_signal`: UnitAttr indicating a custom gradient signal is provided
+        - `sparse`: UnitAttr indicating the gradient signal is one-hot sparse
+        - `return_primal`: UnitAttr indicating the primal result should also be returned (default: false)
     }];
 
     let arguments = (ins FlatSymbolRefAttr:$F, Variadic<AnyType>:$operands);
