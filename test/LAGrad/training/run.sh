@@ -14,24 +14,30 @@ OUTPUT_DIR=output
 
 mkdir -p $OUTPUT_DIR
 
-echo "=== Step 0: Preprocessing (AD + canonicalization) ==="
+echo "=== Step 0: inline ==="
 $LAGRAD_OPT $INPUT \
-  -take-grads \
-  -canonicalize \
-  -o $OUTPUT_DIR/00_preprocessed.mlir
-
-echo "=== Step 1: inline ==="
-$LAGRAD_OPT $OUTPUT_DIR/00_preprocessed.mlir \
   -inline="inlining-threshold=10000" \
+  -canonicalize \
   -linalg-canonicalize \
   -standalone-dce \
   -symbol-dce \
   -canonicalize \
   -cse \
-  -o $OUTPUT_DIR/01_inlined.mlir
+  -o $OUTPUT_DIR/00_inlined.mlir
+
+echo "=== Step 1: AD + canonicalization ==="
+$LAGRAD_OPT $OUTPUT_DIR/00_inlined.mlir \
+  -take-grads \
+  -canonicalize \
+  -linalg-canonicalize \
+  -standalone-dce \
+  -symbol-dce \
+  -canonicalize \
+  -cse \
+  -o $OUTPUT_DIR/01_autograded.mlir
 
 echo "=== Step 2: Bufferization ==="
-$LAGRAD_OPT $OUTPUT_DIR/01_inlined.mlir \
+$LAGRAD_OPT $OUTPUT_DIR/01_autograded.mlir \
   -convert-elementwise-to-linalg \
   -one-shot-bufferize="bufferize-function-boundaries" \
   -convert-bufferization-to-memref \
