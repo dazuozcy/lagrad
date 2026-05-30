@@ -14,6 +14,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
+#include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/SourceMgr.h"
@@ -44,6 +45,9 @@ int main(int argc, char **argv) {
   // will be *parsed* by the tool, not the one generated
 
   registerAllDialects(registry);
+  
+  // Register the inliner extension for func dialect
+  mlir::func::registerInlinerExtension(registry);
 
   return failed(
       mlir::MlirOptMain(argc, argv, "LAGrad optimizer driver\n", registry));

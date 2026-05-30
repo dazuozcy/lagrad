@@ -141,9 +141,11 @@ void runBottomUpDFS(SmallVector<Value> &frontier, ValueSet &out) {
           frontier.push_back(ifOp.elseYield().getOperand(result_idx));
         } else if (auto genericOp =
                        dyn_cast_or_null<linalg::GenericOp>(definingOp)) {
-          assert(genericOp.getNumResults() == 1);
-          frontier.push_back(
-              genericOp.getBody()->getTerminator()->getOperand(0));
+          // Handle generic ops with any number of results
+          auto yieldOp = genericOp.getBody()->getTerminator();
+          for (unsigned i = 0; i < yieldOp->getNumOperands(); ++i) {
+            frontier.push_back(yieldOp->getOperand(i));
+          }
         }
         // If this is a call op, this is oversimplified because some operands
         // might not be active based on the contents of the function body.
