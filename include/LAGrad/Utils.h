@@ -23,6 +23,12 @@ public:
   // A hack for forward mode to track sparse values at the type level when
   // differentiating across function boundaries.
   ValueSet sparseValues;
+
+  // Snapshot of the caller's activeValues before entering this function's
+  // differentiation. Used to avoid pollution from inner function activity
+  // analyses when deciding whether to generate gradient functions for
+  // func.call operands.
+  ValueSet outerActiveValues;
 };
 
 bool isFloatOrFloatTensor(Type typ);
