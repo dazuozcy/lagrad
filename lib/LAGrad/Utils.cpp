@@ -192,6 +192,17 @@ func::FuncOp differentiateFunction(func::FuncOp funcOp, LAGradContext &ctx,
     ops.push_back(&op);
   }
 
+  // Save the caller's outerActiveValues so we can restore it after we return.
+  // This is needed because reverseCallOp (called from populateVJP below) will
+  // recursively call differentiateFunction on inner functions, which will
+  // overwrite ctx.outerActiveValues.
+  ValueSet savedOuterActiveValues = ctx.outerActiveValues;
+
+  // Snapshot the current function's active values BEFORE any inner function
+  // differentiation pollutes ctx.activeValues. This snapshot will be used by
+  // populateVJP to decide which func.call operands need gradient functions.
+  ctx.outerActiveValues = ctx.activeValues;
+
    // env maps values to their gradient signals. x -> x_bar
   llvm::DenseMap<Value, Value> env;
   Value primalResult;
@@ -263,6 +274,10 @@ func::FuncOp differentiateFunction(func::FuncOp funcOp, LAGradContext &ctx,
   funcOp.setType(
       FunctionType::get(funcOp.getContext(), fntyp.getInputs(), returnType));
   rewriter.create<mlir::func::ReturnOp>(region->getLoc(), returnValue);
+
+  // Restore the caller's outerActiveValues.
+  ctx.outerActiveValues = savedOuterActiveValues;
+
   return funcOp;
 }
 
@@ -659,6 +674,17 @@ void populateVJP(Operation *op, LAGradContext &ctx,
               rewriter.create<arith::SubFOp>(loc, powFOp.getRhs(), one)));
     } else if (auto callOp = dyn_cast<func::CallOp>(op)) {
       if (!isFloatOrFloatTensor(operand.getType())) {
+        continue;
+      }
+      // Skip gradient computation for operands that are not active in the
+      // outer function. This avoids generating unnecessary gradient functions
+      // (e.g., __grad_foo_argN) for inputs that don't need gradients.
+      // We use outerActiveValues (a snapshot taken before any inner function
+      // differentiation) instead of activeValues, because activeValues gets
+      // polluted by inner function activity analyses during recursive
+      // differentiation.
+      if (!ctx.outerActiveValues.empty() &&
+          !ctx.outerActiveValues.contains(operand)) {
         continue;
       }
       vjp_value = reverseCallOp(callOp, ctx, vjp_value, op_index, rewriter);

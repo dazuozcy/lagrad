@@ -27,6 +27,7 @@ $LAGRAD_OPT $OUTPUT_DIR/00_preprocessed.mlir \
   -standalone-dce \
   -symbol-dce \
   -canonicalize \
+  -cse \
   -o $OUTPUT_DIR/01_inlined.mlir
 
 echo "=== Step 2: Bufferization ==="
