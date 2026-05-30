@@ -10,6 +10,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MLProgram/IR/MLProgram.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -81,6 +82,7 @@ struct GradTarget : public ConversionTarget {
     addLegalDialect<tensor::TensorDialect>();
     addLegalDialect<mlir::scf::SCFDialect>();
     addLegalDialect<linalg::LinalgDialect>();
+    addLegalDialect<mlir::ml_program::MLProgramDialect>();
     addIllegalDialect<lagrad::LAGradDialect>();
     addLegalOp<lagrad::PackOp>();
     addLegalOp<func::FuncOp>();
