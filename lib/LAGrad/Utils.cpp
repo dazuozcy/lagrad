@@ -141,9 +141,10 @@ cloneBasicBlock(llvm::iterator_range<Region::OpIterator> bbOps,
       if (old_to_new[clonedOp->getOperand(i)]) {
         clonedOp->setOperand(i, old_to_new[clonedOp->getOperand(i)]);
       }
-      for (size_t j = 0; j < op.getNumResults(); j++) {
-        old_to_new[op.getResult(j)] = clonedOp->getResult(j);
-      }
+    }
+    // Update the mapping for the results of this operation
+    for (size_t j = 0; j < op.getNumResults(); j++) {
+      old_to_new[op.getResult(j)] = clonedOp->getResult(j);
     }
     newRegionOps.push_back(clonedOp);
   }
@@ -215,6 +216,11 @@ func::FuncOp differentiateFunction(func::FuncOp funcOp, LAGradContext &ctx,
     } else if (isa<arith::CmpFOp>(op)) {
       continue;
     } else if (op->getNumResults() != 0) {
+      // Skip operations inside nested blocks (e.g., linalg.generic bodies)
+      // These are handled by the parent operation's VJP rule
+      if (op->getParentRegion() != region) {
+        continue;
+      }
       populateVJP(op, ctx, env, rewriter);
     }
   }
@@ -974,6 +980,107 @@ void populateVJP(Operation *op, LAGradContext &ctx,
       }
       vjp_value =
           reverseBatchMatmul(bmmOp, operand, vjp_value, op_index, rewriter);
+    } else if (auto transposeOp = dyn_cast<linalg::TransposeOp>(op)) {
+      // VJP of transpose: if y = transpose(x, perm), then dx = transpose(dy, inv_perm)
+      if (op_index > 0) {
+        // Only compute gradient w.r.t. input (operand 0), not the init tensor
+        continue;
+      }
+      
+      // Get the permutation
+      auto perm = transposeOp.getPermutation();
+      
+      // Compute the inverse permutation
+      SmallVector<int64_t> invPerm(perm.size());
+      for (size_t i = 0; i < perm.size(); ++i) {
+        invPerm[perm[i]] = i;
+      }
+      
+      // Create the init tensor for the transposed gradient
+      auto inputType = operand.getType().cast<RankedTensorType>();
+      auto initTensor = rewriter.create<tensor::EmptyOp>(
+          op->getLoc(), inputType.getShape(), inputType.getElementType());
+      
+      // Create the transposed gradient
+      auto transposedGrad = rewriter.create<linalg::TransposeOp>(
+          op->getLoc(), vjp_value, initTensor, invPerm);
+      
+      vjp_value = transposedGrad.getResult()[0];
+    } else if (auto expandOp = dyn_cast<tensor::ExpandShapeOp>(op)) {
+      // VJP of expand_shape is collapse_shape with the same reassociation
+      auto inputType = operand.getType().cast<RankedTensorType>();
+      auto collapseOp = rewriter.create<tensor::CollapseShapeOp>(
+          op->getLoc(), inputType, vjp_value, expandOp.getReassociationIndices());
+      vjp_value = collapseOp.getResult();
+    } else if (auto collapseOp = dyn_cast<tensor::CollapseShapeOp>(op)) {
+      // VJP of collapse_shape is expand_shape with the same reassociation
+      auto inputType = operand.getType().cast<RankedTensorType>();
+      auto expandOp = rewriter.create<tensor::ExpandShapeOp>(
+          op->getLoc(), inputType, vjp_value, collapseOp.getReassociationIndices());
+      vjp_value = expandOp.getResult();
+    } else if (auto truncfOp = dyn_cast<arith::TruncFOp>(op)) {
+      // VJP of truncf (e.g., f64 -> f32) is extf (extend gradient back to original precision)
+      auto inputType = operand.getType().cast<FloatType>();
+      vjp_value = rewriter.create<arith::ExtFOp>(op->getLoc(), inputType, vjp_value);
+    } else if (auto extfOp = dyn_cast<arith::ExtFOp>(op)) {
+      // VJP of extf (e.g., f32 -> f64) is truncf (truncate gradient back to original precision)
+      auto inputType = operand.getType().cast<FloatType>();
+      vjp_value = rewriter.create<arith::TruncFOp>(op->getLoc(), inputType, vjp_value);
+    } else if (auto rsqrtOp = dyn_cast<math::RsqrtOp>(op)) {
+      // VJP of rsqrt(x) = 1/sqrt(x): dx = -dy / (2 * x * sqrt(x)) = -dy * rsqrt(x) / (2*x)
+      auto loc = op->getLoc();
+      auto two = constLike(loc, operand, 2.0, rewriter);
+      auto twoX = rewriter.create<arith::MulFOp>(loc, two, operand);
+      auto rsqrtX = rsqrtOp.getResult();
+      auto negRsqrt = rewriter.create<arith::NegFOp>(loc, rsqrtX);
+      auto numerator = rewriter.create<arith::MulFOp>(loc, vjp_value, negRsqrt);
+      vjp_value = rewriter.create<arith::DivFOp>(loc, numerator, twoX);
+    } else if (auto erfOp = dyn_cast<math::ErfOp>(op)) {
+      // VJP of erf(x): dx = dy * 2/sqrt(pi) * exp(-x^2)
+      auto loc = op->getLoc();
+      auto twoOverSqrtPi = constLike(loc, operand, 1.1283791670955126, rewriter); // 2/sqrt(pi)
+      auto negX = rewriter.create<arith::NegFOp>(loc, operand);
+      auto xSquared = rewriter.create<arith::MulFOp>(loc, negX, operand);
+      auto expNegXSquared = rewriter.create<math::ExpOp>(loc, xSquared);
+      auto scaled = rewriter.create<arith::MulFOp>(loc, twoOverSqrtPi, expNegXSquared);
+      vjp_value = rewriter.create<arith::MulFOp>(loc, vjp_value, scaled);
+    } else if (auto maxfOp = dyn_cast<arith::MaximumFOp>(op)) {
+      // VJP of max(a, b): da = dy * (a >= b ? 1 : 0), db = dy * (a < b ? 1 : 0)
+      auto loc = op->getLoc();
+      auto a = maxfOp.getLhs();
+      auto b = maxfOp.getRhs();
+      auto cond = rewriter.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OGE, a, b);
+      auto zero = getZero(loc, operand, rewriter);
+      if (op_index == 0) {
+        // Gradient w.r.t. a
+        vjp_value = rewriter.create<arith::SelectOp>(loc, cond, vjp_value, zero);
+      } else {
+        // Gradient w.r.t. b
+        vjp_value = rewriter.create<arith::SelectOp>(loc, cond, zero, vjp_value);
+      }
+    } else if (auto reduceOp = dyn_cast<linalg::ReduceOp>(op)) {
+      // VJP of reduce is broadcast
+      // reduce: tensor<4x1xf32> -> tensor<f32> with dimensions = [0, 1]
+      // VJP: tensor<f32> -> tensor<4x1xf32> with broadcast dimensions = [0, 1]
+      if (op_index == 0) {
+        // Only compute gradient w.r.t. input (operand 0), not the init tensor
+        auto loc = op->getLoc();
+        auto inputType = operand.getType().cast<RankedTensorType>();
+        auto dimensions = reduceOp.getDimensions();
+        
+        // Create init tensor with the same shape as input
+        auto initTensor = rewriter.create<tensor::EmptyOp>(
+            loc, inputType.getShape(), inputType.getElementType());
+        
+        // Broadcast the gradient back to the original shape
+        auto broadcastOp = rewriter.create<linalg::BroadcastOp>(
+            loc, vjp_value, initTensor, dimensions);
+        
+        vjp_value = broadcastOp.getResult()[0];
+      } else {
+        // Gradient w.r.t. init tensor is not computed (it's typically zero or unused)
+        continue;
+      }
     } else {
       llvm::outs() << "(populateVJP) unrecognized op: " << opName << "\n";
     }

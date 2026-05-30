@@ -56,38 +56,13 @@ func.func @mse_loss(
   %cst_4 = arith.constant 4.0 : f32
 
   // Compute difference: y_pred - y_true
-  %diff = linalg.generic
-    {indexing_maps = [#map_sub, #map_sub, #map_sub],
-     iterator_types = ["parallel", "parallel"]}
-    ins(%y_pred, %y_true : tensor<4x1xf32>, tensor<4x1xf32>)
-    outs(%zero_4x1 : tensor<4x1xf32>) {
-  ^bb0(%in1: f32, %in2: f32, %out: f32):
-    %d = arith.subf %in1, %in2 : f32
-    linalg.yield %d : f32
-  } -> tensor<4x1xf32>
-
-  // Square the difference
-  %squared = linalg.generic
-    {indexing_maps = [#map_square, #map_square],
-     iterator_types = ["parallel", "parallel"]}
-    ins(%diff : tensor<4x1xf32>)
-    outs(%zero_4x1 : tensor<4x1xf32>) {
-  ^bb0(%in: f32, %out: f32):
-    %sq = arith.mulf %in, %in : f32
-    linalg.yield %sq : f32
-  } -> tensor<4x1xf32>
+  %diff = arith.subf %y_pred, %y_true : tensor<4x1xf32>
+  %squared = arith.mulf %diff, %diff : tensor<4x1xf32>
 
   // Sum all elements - use tensor<f32> for reduction
   %zero_scalar = arith.constant dense<0.0> : tensor<f32>
-  %sum_tensor = linalg.generic
-    {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> ()>],
-     iterator_types = ["reduction", "reduction"]}
-    ins(%squared : tensor<4x1xf32>)
-    outs(%zero_scalar : tensor<f32>) {
-  ^bb0(%in: f32, %out: f32):
-    %s = arith.addf %in, %out : f32
-    linalg.yield %s : f32
-  } -> tensor<f32>
+  %sum_tensor = linalg.reduce ins(%squared : tensor<4x1xf32>) outs(%zero_scalar : tensor<f32>) dimensions = [0, 1]
+                (%in: f32, %out: f32) { %sum = arith.addf %in, %out : f32 linalg.yield %sum : f32}
 
   // Extract scalar from tensor
   %sum = tensor.extract %sum_tensor[] : tensor<f32>
@@ -106,7 +81,7 @@ func.func @forward_and_loss(
   %y_true: tensor<4x1xf32>,
   %W: tensor<2x1xf32>,
   %b: tensor<1xf32>
-) -> f32 {
+) -> f32 attributes {no_inline} {
   %y_pred = func.call @forward(%X, %W, %b) : (tensor<4x2xf32>, tensor<2x1xf32>, tensor<1xf32>) -> tensor<4x1xf32>
   %loss = func.call @mse_loss(%y_pred, %y_true) : (tensor<4x1xf32>, tensor<4x1xf32>) -> f32
   return %loss : f32
@@ -121,7 +96,7 @@ func.func @compute_loss_and_gradients(
   %y_true: tensor<4x1xf32>,
   %W: tensor<2x1xf32>,
   %b: tensor<1xf32>
-) -> (tensor<2x1xf32>, tensor<1xf32>, f32) {
+) -> (tensor<2x1xf32>, tensor<1xf32>, f32) attributes {no_inline} {
   // Compute gradients and loss in one call
   // lagrad.grad with {return_primal} returns: gradients for W and b, plus the primal result (loss)
   %dW, %db, %loss = lagrad.grad @forward_and_loss(%X, %y_true, %W, %b)
@@ -141,7 +116,7 @@ func.func @sgd_update(
   %dW: tensor<2x1xf32>,
   %db: tensor<1xf32>,
   %lr: f32
-) -> (tensor<2x1xf32>, tensor<1xf32>) {
+) -> (tensor<2x1xf32>, tensor<1xf32>) attributes {no_inline} {
   %zero_2x1 = arith.constant dense<0.0> : tensor<2x1xf32>
   %zero_1 = arith.constant dense<0.0> : tensor<1xf32>
 
@@ -181,7 +156,7 @@ func.func @train_step(
   %W: tensor<2x1xf32>,
   %b: tensor<1xf32>,
   %lr: f32
-) -> (tensor<2x1xf32>, tensor<1xf32>, f32) {
+) -> (tensor<2x1xf32>, tensor<1xf32>, f32) attributes {no_inline} {
   // Compute loss and gradients in one call
   %dW, %db, %loss = func.call @compute_loss_and_gradients(%X, %y_true, %W, %b)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>)
@@ -198,7 +173,7 @@ func.func @train_step(
 // ============================================================================
 // Main Entry Point - Training with progress output
 // ============================================================================
-func.func @mlir_main() attributes {llvm.emit_c_interface} {
+func.func @mlir_main() attributes {llvm.emit_c_interface, no_inline} {
   // Training data: 4 samples, 2 features
   // X = [[1, 2], [3, 4], [5, 6], [7, 8]]
   %X = arith.constant dense<[
