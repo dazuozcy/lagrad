@@ -22,12 +22,13 @@ func.func @forward(
   %b: tensor<1xf32>
 ) -> tensor<4x1xf32> {
   %cst_zero = arith.constant 0.0 : f32
-  %zero_4x1 = arith.constant dense<0.0> : tensor<4x1xf32>
+  %0 = tensor.empty() : tensor<4x1xf32>
+  %1 = linalg.fill ins(%cst_zero : f32) outs(%0 : tensor<4x1xf32>) -> tensor<4x1xf32>
 
   // Matrix multiplication: X @ W
   %matmul = linalg.matmul
     ins(%X, %W : tensor<4x2xf32>, tensor<2x1xf32>)
-    outs(%zero_4x1 : tensor<4x1xf32>)
+    outs(%1 : tensor<4x1xf32>)
     -> tensor<4x1xf32>
 
   // Add bias: matmul + b (broadcast)
@@ -35,7 +36,7 @@ func.func @forward(
     {indexing_maps = [#map_broadcast_add, #map_broadcast_add_b, #map_broadcast_add],
      iterator_types = ["parallel", "parallel"]}
     ins(%matmul, %b : tensor<4x1xf32>, tensor<1xf32>)
-    outs(%zero_4x1 : tensor<4x1xf32>) {
+    outs(%1 : tensor<4x1xf32>) {
   ^bb0(%in1: f32, %in2: f32, %out: f32):
     %sum = arith.addf %in1, %in2 : f32
     linalg.yield %sum : f32
@@ -50,10 +51,8 @@ func.func @forward(
 func.func @mse_loss(
   %y_pred: tensor<4x1xf32>,
   %y_true: tensor<4x1xf32>
-) -> f32 {
-  %cst_zero = arith.constant 0.0 : f32
-  %zero_4x1 = arith.constant dense<0.0> : tensor<4x1xf32>
-  %cst_4 = arith.constant 4.0 : f32
+) -> tensor<f32> {
+  %cst_4 = arith.constant dense<4.0> : tensor<f32>
 
   // Compute difference: y_pred - y_true
   %diff = arith.subf %y_pred, %y_true : tensor<4x1xf32>
@@ -64,13 +63,10 @@ func.func @mse_loss(
   %sum_tensor = linalg.reduce ins(%squared : tensor<4x1xf32>) outs(%zero_scalar : tensor<f32>) dimensions = [0, 1]
                 (%in: f32, %out: f32) { %sum = arith.addf %in, %out : f32 linalg.yield %sum : f32}
 
-  // Extract scalar from tensor
-  %sum = tensor.extract %sum_tensor[] : tensor<f32>
-
   // Divide by number of samples (4)
-  %mse = arith.divf %sum, %cst_4 : f32
+  %mse = arith.divf %sum_tensor, %cst_4 : tensor<f32>
 
-  return %mse : f32
+  return %mse : tensor<f32>
 }
 
 // ============================================================================
@@ -81,10 +77,10 @@ func.func @forward_and_loss(
   %y_true: tensor<4x1xf32>,
   %W: tensor<2x1xf32>,
   %b: tensor<1xf32>
-) -> f32 attributes {no_inline} {
+) -> tensor<f32> attributes {no_inline} {
   %y_pred = func.call @forward(%X, %W, %b) : (tensor<4x2xf32>, tensor<2x1xf32>, tensor<1xf32>) -> tensor<4x1xf32>
-  %loss = func.call @mse_loss(%y_pred, %y_true) : (tensor<4x1xf32>, tensor<4x1xf32>) -> f32
-  return %loss : f32
+  %loss = func.call @mse_loss(%y_pred, %y_true) : (tensor<4x1xf32>, tensor<4x1xf32>) -> tensor<f32>
+  return %loss : tensor<f32>
 }
 
 // ============================================================================
@@ -96,15 +92,15 @@ func.func @compute_loss_and_gradients(
   %y_true: tensor<4x1xf32>,
   %W: tensor<2x1xf32>,
   %b: tensor<1xf32>
-) -> (tensor<2x1xf32>, tensor<1xf32>, f32) attributes {no_inline} {
+) -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>) attributes {no_inline} {
   // Compute gradients and loss in one call
   // lagrad.grad with {return_primal} returns: gradients for W and b, plus the primal result (loss)
   %dW, %db, %loss = lagrad.grad @forward_and_loss(%X, %y_true, %W, %b)
     {of = [2, 3], return_primal} :
     (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
 
-  return %dW, %db, %loss : tensor<2x1xf32>, tensor<1xf32>, f32
+  return %dW, %db, %loss : tensor<2x1xf32>, tensor<1xf32>, tensor<f32>
 }
 
 // ============================================================================
@@ -156,18 +152,18 @@ func.func @train_step(
   %W: tensor<2x1xf32>,
   %b: tensor<1xf32>,
   %lr: f32
-) -> (tensor<2x1xf32>, tensor<1xf32>, f32) attributes {no_inline} {
+) -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>) attributes {no_inline} {
   // Compute loss and gradients in one call
   %dW, %db, %loss = func.call @compute_loss_and_gradients(%X, %y_true, %W, %b)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
 
   // Update parameters
   %W_new, %b_new = func.call @sgd_update(%W, %b, %dW, %db, %lr)
     : (tensor<2x1xf32>, tensor<1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
     -> (tensor<2x1xf32>, tensor<1xf32>)
 
-  return %W_new, %b_new, %loss : tensor<2x1xf32>, tensor<1xf32>, f32
+  return %W_new, %b_new, %loss : tensor<2x1xf32>, tensor<1xf32>, tensor<f32>
 }
 
 // ============================================================================
@@ -209,8 +205,9 @@ func.func @mlir_main() attributes {llvm.emit_c_interface, no_inline} {
   %c1 = arith.constant 1 : index
 
   // // Compute initial loss
-  // %loss_init = func.call @forward_and_loss(%X, %y_true, %W_init, %b_init)
-  //   : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>) -> f32
+  // %loss_init_t = func.call @forward_and_loss(%X, %y_true, %W_init, %b_init)
+  //   : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>) -> tensor<f32>
+  // %loss_init = tensor.extract %loss_init_t[] : tensor<f32>
 
   // // Extract and print initial parameters
   // %w0_init = tensor.extract %W_init[%c0, %c0] : tensor<2x1xf32>
@@ -221,9 +218,10 @@ func.func @mlir_main() attributes {llvm.emit_c_interface, no_inline} {
   //   : (i32, f32, f32, f32, f32) -> ()
 
   // Training step 1
-  %W1, %b1, %loss1 = func.call @train_step(%X, %y_true, %W_init, %b_init, %lr)
+  %W1, %b1, %loss1_t = func.call @train_step(%X, %y_true, %W_init, %b_init, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %loss1 = tensor.extract %loss1_t[] : tensor<f32>
   %w0_1 = tensor.extract %W1[%c0, %c0] : tensor<2x1xf32>
   %w1_1 = tensor.extract %W1[%c1, %c0] : tensor<2x1xf32>
   %b0_1 = tensor.extract %b1[%c0] : tensor<1xf32>
@@ -232,9 +230,10 @@ func.func @mlir_main() attributes {llvm.emit_c_interface, no_inline} {
     : (i32, f32, f32, f32, f32) -> ()
 
   // Training step 2
-  %W2, %b2, %loss2 = func.call @train_step(%X, %y_true, %W1, %b1, %lr)
+  %W2, %b2, %loss2_t = func.call @train_step(%X, %y_true, %W1, %b1, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %loss2 = tensor.extract %loss2_t[] : tensor<f32>
   %w0_2 = tensor.extract %W2[%c0, %c0] : tensor<2x1xf32>
   %w1_2 = tensor.extract %W2[%c1, %c0] : tensor<2x1xf32>
   %b0_2 = tensor.extract %b2[%c0] : tensor<1xf32>
@@ -243,9 +242,10 @@ func.func @mlir_main() attributes {llvm.emit_c_interface, no_inline} {
     : (i32, f32, f32, f32, f32) -> ()
 
   // Training step 3
-  %W3, %b3, %loss3 = func.call @train_step(%X, %y_true, %W2, %b2, %lr)
+  %W3, %b3, %loss3_t = func.call @train_step(%X, %y_true, %W2, %b2, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %loss3 = tensor.extract %loss3_t[] : tensor<f32>
   %w0_3 = tensor.extract %W3[%c0, %c0] : tensor<2x1xf32>
   %w1_3 = tensor.extract %W3[%c1, %c0] : tensor<2x1xf32>
   %b0_3 = tensor.extract %b3[%c0] : tensor<1xf32>
@@ -254,9 +254,10 @@ func.func @mlir_main() attributes {llvm.emit_c_interface, no_inline} {
     : (i32, f32, f32, f32, f32) -> ()
 
   // Training step 4
-  %W4, %b4, %loss4 = func.call @train_step(%X, %y_true, %W3, %b3, %lr)
+  %W4, %b4, %loss4_t = func.call @train_step(%X, %y_true, %W3, %b3, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %loss4 = tensor.extract %loss4_t[] : tensor<f32>
   %w0_4 = tensor.extract %W4[%c0, %c0] : tensor<2x1xf32>
   %w1_4 = tensor.extract %W4[%c1, %c0] : tensor<2x1xf32>
   %b0_4 = tensor.extract %b4[%c0] : tensor<1xf32>
@@ -265,9 +266,10 @@ func.func @mlir_main() attributes {llvm.emit_c_interface, no_inline} {
     : (i32, f32, f32, f32, f32) -> ()
 
   // Training step 5
-  %W5, %b5, %loss5 = func.call @train_step(%X, %y_true, %W4, %b4, %lr)
+  %W5, %b5, %loss5_t = func.call @train_step(%X, %y_true, %W4, %b4, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %loss5 = tensor.extract %loss5_t[] : tensor<f32>
   %w0_5 = tensor.extract %W5[%c0, %c0] : tensor<2x1xf32>
   %w1_5 = tensor.extract %W5[%c1, %c0] : tensor<2x1xf32>
   %b0_5 = tensor.extract %b5[%c0] : tensor<1xf32>
@@ -276,9 +278,10 @@ func.func @mlir_main() attributes {llvm.emit_c_interface, no_inline} {
     : (i32, f32, f32, f32, f32) -> ()
 
   // Training step 6
-  %W6, %b6, %loss6 = func.call @train_step(%X, %y_true, %W5, %b5, %lr)
+  %W6, %b6, %loss6_t = func.call @train_step(%X, %y_true, %W5, %b5, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %loss6 = tensor.extract %loss6_t[] : tensor<f32>
   %w0_6 = tensor.extract %W6[%c0, %c0] : tensor<2x1xf32>
   %w1_6 = tensor.extract %W6[%c1, %c0] : tensor<2x1xf32>
   %b0_6 = tensor.extract %b6[%c0] : tensor<1xf32>
@@ -287,9 +290,10 @@ func.func @mlir_main() attributes {llvm.emit_c_interface, no_inline} {
     : (i32, f32, f32, f32, f32) -> ()
 
   // Training step 7
-  %W7, %b7, %loss7 = func.call @train_step(%X, %y_true, %W6, %b6, %lr)
+  %W7, %b7, %loss7_t = func.call @train_step(%X, %y_true, %W6, %b6, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %loss7 = tensor.extract %loss7_t[] : tensor<f32>
   %w0_7 = tensor.extract %W7[%c0, %c0] : tensor<2x1xf32>
   %w1_7 = tensor.extract %W7[%c1, %c0] : tensor<2x1xf32>
   %b0_7 = tensor.extract %b7[%c0] : tensor<1xf32>
@@ -298,9 +302,10 @@ func.func @mlir_main() attributes {llvm.emit_c_interface, no_inline} {
     : (i32, f32, f32, f32, f32) -> ()
 
   // Training step 8
-  %W8, %b8, %loss8 = func.call @train_step(%X, %y_true, %W7, %b7, %lr)
+  %W8, %b8, %loss8_t = func.call @train_step(%X, %y_true, %W7, %b7, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %loss8 = tensor.extract %loss8_t[] : tensor<f32>
   %w0_8 = tensor.extract %W8[%c0, %c0] : tensor<2x1xf32>
   %w1_8 = tensor.extract %W8[%c1, %c0] : tensor<2x1xf32>
   %b0_8 = tensor.extract %b8[%c0] : tensor<1xf32>
@@ -309,9 +314,10 @@ func.func @mlir_main() attributes {llvm.emit_c_interface, no_inline} {
     : (i32, f32, f32, f32, f32) -> ()
 
   // Training step 9
-  %W9, %b9, %loss9 = func.call @train_step(%X, %y_true, %W8, %b8, %lr)
+  %W9, %b9, %loss9_t = func.call @train_step(%X, %y_true, %W8, %b8, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %loss9 = tensor.extract %loss9_t[] : tensor<f32>
   %w0_9 = tensor.extract %W9[%c0, %c0] : tensor<2x1xf32>
   %w1_9 = tensor.extract %W9[%c1, %c0] : tensor<2x1xf32>
   %b0_9 = tensor.extract %b9[%c0] : tensor<1xf32>
@@ -320,9 +326,10 @@ func.func @mlir_main() attributes {llvm.emit_c_interface, no_inline} {
     : (i32, f32, f32, f32, f32) -> ()
 
   // Training step 10
-  %W10, %b10, %loss10 = func.call @train_step(%X, %y_true, %W9, %b9, %lr)
+  %W10, %b10, %loss10_t = func.call @train_step(%X, %y_true, %W9, %b9, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %loss10 = tensor.extract %loss10_t[] : tensor<f32>
   %w0_10 = tensor.extract %W10[%c0, %c0] : tensor<2x1xf32>
   %w1_10 = tensor.extract %W10[%c1, %c0] : tensor<2x1xf32>
   %b0_10 = tensor.extract %b10[%c0] : tensor<1xf32>
@@ -331,21 +338,22 @@ func.func @mlir_main() attributes {llvm.emit_c_interface, no_inline} {
     : (i32, f32, f32, f32, f32) -> ()
 
   // Training step 15 (skip a few for brevity)
-  %W11, %b11, %loss11 = func.call @train_step(%X, %y_true, %W10, %b10, %lr)
+  %W11, %b11, %loss11_t = func.call @train_step(%X, %y_true, %W10, %b10, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
-  %W12, %b12, %loss12 = func.call @train_step(%X, %y_true, %W11, %b11, %lr)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %W12, %b12, %loss12_t = func.call @train_step(%X, %y_true, %W11, %b11, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
-  %W13, %b13, %loss13 = func.call @train_step(%X, %y_true, %W12, %b12, %lr)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %W13, %b13, %loss13_t = func.call @train_step(%X, %y_true, %W12, %b12, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
-  %W14, %b14, %loss14 = func.call @train_step(%X, %y_true, %W13, %b13, %lr)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %W14, %b14, %loss14_t = func.call @train_step(%X, %y_true, %W13, %b13, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
-  %W15, %b15, %loss15 = func.call @train_step(%X, %y_true, %W14, %b14, %lr)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %W15, %b15, %loss15_t = func.call @train_step(%X, %y_true, %W14, %b14, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %loss15 = tensor.extract %loss15_t[] : tensor<f32>
   %w0_15 = tensor.extract %W15[%c0, %c0] : tensor<2x1xf32>
   %w1_15 = tensor.extract %W15[%c1, %c0] : tensor<2x1xf32>
   %b0_15 = tensor.extract %b15[%c0] : tensor<1xf32>
@@ -354,21 +362,22 @@ func.func @mlir_main() attributes {llvm.emit_c_interface, no_inline} {
     : (i32, f32, f32, f32, f32) -> ()
 
   // Training step 20
-  %W16, %b16, %loss16 = func.call @train_step(%X, %y_true, %W15, %b15, %lr)
+  %W16, %b16, %loss16_t = func.call @train_step(%X, %y_true, %W15, %b15, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
-  %W17, %b17, %loss17 = func.call @train_step(%X, %y_true, %W16, %b16, %lr)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %W17, %b17, %loss17_t = func.call @train_step(%X, %y_true, %W16, %b16, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
-  %W18, %b18, %loss18 = func.call @train_step(%X, %y_true, %W17, %b17, %lr)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %W18, %b18, %loss18_t = func.call @train_step(%X, %y_true, %W17, %b17, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
-  %W19, %b19, %loss19 = func.call @train_step(%X, %y_true, %W18, %b18, %lr)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %W19, %b19, %loss19_t = func.call @train_step(%X, %y_true, %W18, %b18, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
-  %W20, %b20, %loss20 = func.call @train_step(%X, %y_true, %W19, %b19, %lr)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %W20, %b20, %loss20_t = func.call @train_step(%X, %y_true, %W19, %b19, %lr)
     : (tensor<4x2xf32>, tensor<4x1xf32>, tensor<2x1xf32>, tensor<1xf32>, f32)
-    -> (tensor<2x1xf32>, tensor<1xf32>, f32)
+    -> (tensor<2x1xf32>, tensor<1xf32>, tensor<f32>)
+  %loss20 = tensor.extract %loss20_t[] : tensor<f32>
   %w0_20 = tensor.extract %W20[%c0, %c0] : tensor<2x1xf32>
   %w1_20 = tensor.extract %W20[%c1, %c0] : tensor<2x1xf32>
   %b0_20 = tensor.extract %b20[%c0] : tensor<1xf32>
