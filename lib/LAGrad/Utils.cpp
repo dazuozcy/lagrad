@@ -960,45 +960,46 @@ void populateVJP(Operation *op, LAGradContext &ctx,
       if (op_index > 1) {
         continue;
       }
+      auto loc = op->getLoc();
+      Value lhs, rhs, toTranspose;
+      if (op_index == 0) {
+        lhs = vjp_value;
+        toTranspose = op->getOperand(1);
+      } else {
+        toTranspose = op->getOperand(0);
+        rhs = vjp_value;
+      }
+      auto transType = toTranspose.getType().cast<RankedTensorType>();
+      auto transShape = transType.getShape();
+      auto intToAttr = [&](int64_t i) {
+        return IntegerAttr::get(IntegerType::get(rewriter.getContext(), 64), i);
+      };
+      SmallVector<OpFoldResult> emptyShape;
+      for (int i = 0; i < 2; i++) {
+        int srcDim = (i == 0) ? 1 : 0;
+        if (transType.isDynamicDim(srcDim)) {
+          emptyShape.push_back(
+              rewriter.create<tensor::DimOp>(loc, toTranspose, srcDim).getResult());
+        } else {
+          emptyShape.push_back(intToAttr(transShape[srcDim]));
+        }
+      }
+      auto transEmpty = rewriter.create<tensor::EmptyOp>(
+          loc, emptyShape, transType.getElementType());
+      SmallVector<int64_t> perm = {1, 0};
+      auto transposeOp = rewriter.create<linalg::TransposeOp>(
+          loc, toTranspose, transEmpty, perm);
+      Value transposed = transposeOp->getResult(0);
+      if (op_index == 0) {
+        rhs = transposed;
+      } else {
+        lhs = transposed;
+      }
       Value zero = env[operand] ? env[operand]
-                                : getZero(operand.getLoc(), operand, rewriter,
+                                : getZero(loc, operand, rewriter,
                                           /*init=*/true);
-      SmallVector<AffineMap, 3> indexingMaps(
-          op->getNumOperands(), rewriter.getMultiDimIdentityMap(3));
-      if (op_index == 0) {
-        indexingMaps[0] = indexingMaps[0].getSubMap({0, 1});
-        indexingMaps[1] = indexingMaps[1].getSubMap({2, 1});
-        indexingMaps[2] = indexingMaps[2].getSubMap({0, 2});
-      } else {
-        indexingMaps[0] = indexingMaps[0].getSubMap({1, 0});
-        indexingMaps[1] = indexingMaps[1].getSubMap({1, 2});
-        indexingMaps[2] = indexingMaps[2].getSubMap({0, 2});
-      }
-      SmallVector<utils::IteratorType, 6> iteratorTypes({utils::IteratorType::parallel,
-                                               utils::IteratorType::reduction,
-                                               utils::IteratorType::parallel});
-      SmallVector<Value> inputs(2);
-      if (op_index == 0) {
-        inputs[0] = vjp_value;
-        inputs[1] = op->getOperand(1);
-      } else {
-        inputs[0] = op->getOperand(0);
-        inputs[1] = vjp_value;
-      }
-      auto library_call =
-          op_index == 0 ? "smatmul_grad_first" : "smatmul_grad_second";
-      auto matmulOp = rewriter.create<linalg::GenericOp>(
-          operand.getLoc(), operand.getType(), inputs, ValueRange({zero}),
-          indexingMaps, iteratorTypes,
-          /*doc=*/"Transposed matrix multiplication",
-          /*library call=*/library_call,
-          [&](OpBuilder &builder, Location loc, ValueRange regionArgs) {
-            Value mul_res = builder.create<arith::MulFOp>(loc, regionArgs[0],
-                                                          regionArgs[1]);
-            Value add_res =
-                builder.create<arith::AddFOp>(loc, regionArgs[2], mul_res);
-            builder.create<linalg::YieldOp>(loc, add_res);
-          });
+      auto matmulOp = rewriter.create<linalg::MatmulOp>(
+          loc, TypeRange{operand.getType()}, ValueRange{lhs, rhs}, ValueRange{zero});
       vjp_value = matmulOp.getResult(0);
     } else if (auto bmmOp = dyn_cast<linalg::BatchMatmulOp>(op)) {
       if (op_index > 1) {
