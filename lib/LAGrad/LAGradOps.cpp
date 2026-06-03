@@ -76,9 +76,14 @@ LogicalResult GradOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   }
 
   // The op returns gradients for each argument in 'of'.
-  // When topLevel (no customGradSignal) and return_primal is set, it also returns the primal result.
+  // When topLevel (no customGradSignal) and return_primal is set, it also returns:
+  // - The primal result (at index primalOf)
+  // - All other non-primal return values
   bool returnPrimal = (*this)->hasAttrOfType<UnitAttr>("return_primal");
-  size_t expectedResults = gradientsOf.size() + ((customGradSignal || !returnPrimal) ? 0 : 1);
+  size_t expectedResults = gradientsOf.size();
+  if (!customGradSignal && returnPrimal) {
+    expectedResults += fnType.getNumResults();
+  }
   if (expectedResults != getNumResults())
     return emitOpError("incorrect number of results");
 
@@ -92,16 +97,36 @@ LogicalResult GradOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
     }
   }
 
-  // Verify the last result is the primal result (function's return type)
+  // Verify the primal result and non-primal return values
   // Only when topLevel (no customGradSignal) and return_primal is set
   if (!customGradSignal && returnPrimal) {
-    if (fnType.getNumResults() != 1)
-      return emitOpError("differentiated function must have exactly 1 result");
-    if (getResult(gradientsOf.size()).getType() != fnType.getResult(0)) {
+    auto primalOfAttr = (*this)->getAttrOfType<IntegerAttr>("primal_of");
+    int64_t primalOf = primalOfAttr ? primalOfAttr.getValue().getSExtValue() : 0;
+
+    if (primalOf < 0 || primalOf >= (int64_t)fnType.getNumResults())
+      return emitOpError("'primal_of' index ") << primalOf
+             << " out of range, function has " << fnType.getNumResults()
+             << " results";
+
+    // Check primal result type
+    if (getResult(gradientsOf.size()).getType() != fnType.getResult(primalOf)) {
       auto diag = emitOpError("primal result type mismatch");
       diag.attachNote() << "   op result type: " << getResult(gradientsOf.size()).getType();
-      diag.attachNote() << "function result type: " << fnType.getResult(0);
+      diag.attachNote() << "function result type: " << fnType.getResult(primalOf);
       return diag;
+    }
+
+    // Check non-primal return value types
+    unsigned resultIdx = gradientsOf.size() + 1;
+    for (unsigned i = 0; i < fnType.getNumResults(); i++) {
+      if ((int64_t)i == primalOf) continue;
+      if (getResult(resultIdx).getType() != fnType.getResult(i)) {
+        auto diag = emitOpError("non-primal result type mismatch at function return index ") << i;
+        diag.attachNote() << "   op result type: " << getResult(resultIdx).getType();
+        diag.attachNote() << "function result type: " << fnType.getResult(i);
+        return diag;
+      }
+      resultIdx++;
     }
   }
 
