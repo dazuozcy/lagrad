@@ -41,19 +41,21 @@ private:
     auto moduleOp = gradOp->getParentOfType<ModuleOp>();
     auto originalFuncOp = moduleOp.lookupSymbol<func::FuncOp>(gradOp.getFAttr());
 
-    std::string adjointFuncName = ("__grad_" + originalFuncOp.getName()).str();
-
-    if (auto existingAdjoint = moduleOp.lookupSymbol<func::FuncOp>(adjointFuncName)) {
-      return existingAdjoint;
-    }
-
-    // If we differentiate the same function multiple times w.r.t. different
-    // args this will fail. Handling this properly requires some kind of name
-    // mangling.
     auto gradientsOf = gradOp->getAttr("of").dyn_cast_or_null<ArrayAttr>();
     bool customGradSignal = gradOp->hasAttrOfType<UnitAttr>("grad_signal");
     bool oneHotSparse = gradOp->hasAttrOfType<UnitAttr>("sparse");
     bool returnPrimal = gradOp->hasAttrOfType<UnitAttr>("return_primal");
+    auto primalOfAttr = gradOp->getAttrOfType<IntegerAttr>("primal_of");
+    int64_t primalOf = primalOfAttr ? primalOfAttr.getValue().getSExtValue() : 0;
+
+    std::string adjointFuncName = ("__grad_" + originalFuncOp.getName()).str();
+    if (primalOf != 0) {
+      adjointFuncName += ("_primal" + std::to_string(primalOf));
+    }
+
+    if (auto existingAdjoint = moduleOp.lookupSymbol<func::FuncOp>(adjointFuncName)) {
+      return existingAdjoint;
+    }
 
     // If we received request for a custom gradient signal, this is equivalent
     // to taking in the gradient signal as a parameter.
@@ -67,7 +69,8 @@ private:
     return differentiateFunction(funcOp, lagradctx, gradientsOf, rewriter,
                                  /*topLevel=*/!customGradSignal,
                                  /*onehotsparse=*/oneHotSparse,
-                                 /*returnPrimal=*/returnPrimal);
+                                 /*returnPrimal=*/returnPrimal,
+                                 /*primalOf=*/primalOf);
   }
 };
 } // end anonymous namespace

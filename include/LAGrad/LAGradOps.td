@@ -40,6 +40,10 @@ def LAGrad_GradOp : LAGrad_Op<"grad", [
         - `grad_signal`: UnitAttr indicating a custom gradient signal is provided
         - `sparse`: UnitAttr indicating the gradient signal is one-hot sparse
         - `return_primal`: UnitAttr indicating the primal result should also be returned (default: false)
+        - `primal_of`: IntegerAttr specifying which return value index is the "real" output for
+          backpropagation when the function has multiple return values (default: 0). Other return
+          values are treated as pass-through data (e.g., updated running statistics) and do not
+          receive gradient signals.
     }];
 
     let arguments = (ins FlatSymbolRefAttr:$F, Variadic<AnyType>:$operands);

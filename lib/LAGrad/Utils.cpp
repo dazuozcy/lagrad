@@ -166,18 +166,18 @@ func::FuncOp differentiateFunction(func::FuncOp funcOp, LAGradContext &ctx,
                              ArrayAttr gradientsOf,
                              ConversionPatternRewriter &rewriter,
                              bool topLevel, bool oneHotSparse,
-                             bool returnPrimal) {
+                             bool returnPrimal, int64_t primalOf) {
   Region *region = funcOp.getCallableRegion();
   if (!region) {
     funcOp->emitError("Function region cannot be null");
     return nullptr;
   }
 
-  // Need to double check the return type.
-  assert(funcOp.getFunctionType().getNumResults() == 1 &&
-         "differentiating functions with more than one result not supported");
+  auto numResults = funcOp.getFunctionType().getNumResults();
+  assert(primalOf >= 0 && primalOf < (int64_t)numResults &&
+         "primalOf index out of range");
   if (!topLevel) {
-    Type gradSignalType = funcOp.getFunctionType().getResult(0);
+    Type gradSignalType = funcOp.getFunctionType().getResult(primalOf);
     if (oneHotSparse && gradSignalType.isa<RankedTensorType>()) {
       auto tensorType = gradSignalType.cast<RankedTensorType>();
       gradSignalType = RankedTensorType::get(
@@ -206,15 +206,18 @@ func::FuncOp differentiateFunction(func::FuncOp funcOp, LAGradContext &ctx,
    // env maps values to their gradient signals. x -> x_bar
   llvm::DenseMap<Value, Value> env;
   Value primalResult;
+  SmallVector<Value> allReturnValues;
   PatternRewriter::InsertionGuard insertGuard(rewriter);
   for (auto it = ops.rbegin(); it != ops.rend(); it++) {
     Operation *op = *it;
     if (isa<func::ReturnOp>(op)) {
       // This is the exit point
       rewriter.setInsertionPoint(op);
-      assert(op->getNumOperands() == 1 &&
-             "Expected function to return 1 value");
-      Value operand = op->getOperand(0);
+      // Capture all return values
+      for (unsigned i = 0; i < op->getNumOperands(); i++) {
+        allReturnValues.push_back(op->getOperand(i));
+      }
+      Value operand = op->getOperand(primalOf);
       primalResult = operand;
       // Initialize the gradient signal to 1.0
       if (topLevel) {
@@ -270,6 +273,13 @@ func::FuncOp differentiateFunction(func::FuncOp funcOp, LAGradContext &ctx,
   if (topLevel && returnPrimal && primalResult) {
     returnType.push_back(primalResult.getType());
     returnValue.push_back(primalResult);
+    // Append non-primal return values (e.g., updated BN stats)
+    for (unsigned i = 0; i < allReturnValues.size(); i++) {
+      if ((int64_t)i != primalOf) {
+        returnType.push_back(allReturnValues[i].getType());
+        returnValue.push_back(allReturnValues[i]);
+      }
+    }
   }
   funcOp.setType(
       FunctionType::get(funcOp.getContext(), fntyp.getInputs(), returnType));
