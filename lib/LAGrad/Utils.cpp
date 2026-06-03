@@ -483,6 +483,47 @@ Value addInPlace(Value source, Value dest, OpBuilder &builder) {
   }
   assert(dest.getType().isa<RankedTensorType>() &&
          "add in place expects a ranked tensor destination");
+  
+  // Optimization: if source == dest, just return source (avoid adding to itself)
+  if (source == dest) {
+    return source;
+  }
+  
+  // Optimization: if source and dest are from the same defining operation,
+  // they represent the same computation, so just return source
+  if (source.getDefiningOp() && dest.getDefiningOp() &&
+      source.getDefiningOp() == dest.getDefiningOp()) {
+    return source;
+  }
+  
+  // Optimization: if dest is a zero tensor (from getZero), just return source
+  // This avoids creating unnecessary "Add in place" operations
+  if (auto destOp = dest.getDefiningOp()) {
+    // Check if dest is from a fill operation with zero
+    if (auto fillOp = dyn_cast<linalg::FillOp>(destOp)) {
+      Value fillInput = fillOp.getDpsInputs()[0];
+      if (auto constOp = fillInput.getDefiningOp<arith::ConstantOp>()) {
+        auto attr = constOp.getValue();
+        if (auto denseAttr = attr.dyn_cast<DenseFPElementsAttr>()) {
+          if (denseAttr.isSplat() && denseAttr.getSplatValue<APFloat>().isZero()) {
+            // dest is a zero-filled tensor, just return source
+            return source;
+          }
+        }
+      }
+    }
+    // Check if dest is from a constant operation with zero
+    if (auto constOp = dyn_cast<arith::ConstantOp>(destOp)) {
+      auto attr = constOp.getValue();
+      if (auto denseAttr = attr.dyn_cast<DenseFPElementsAttr>()) {
+        if (denseAttr.isSplat() && denseAttr.getSplatValue<APFloat>().isZero()) {
+          // dest is a zero constant, just return source
+          return source;
+        }
+      }
+    }
+  }
+  
   auto outputShape = dest.getType().dyn_cast<RankedTensorType>();
   auto rank = outputShape.getRank();
   SmallVector<AffineMap, 2> indexingMaps(2,
